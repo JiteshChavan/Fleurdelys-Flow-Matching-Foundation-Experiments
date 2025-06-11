@@ -1,0 +1,7 @@
+setup environment
+install torch
+install requirements
+install cuda 11.7
+install causal_conv1d
+make sure correct g++ and c++ compilers (which c++/g++)
+import causal_conv1d_cuda (should work)
