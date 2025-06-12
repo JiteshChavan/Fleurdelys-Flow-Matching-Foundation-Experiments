@@ -157,8 +157,99 @@ def main (args):
     device = rank % torch.cuda.device_count()
     world_size = dist.get_world_size()
     assert args.global_batch_size % world_size == 0, "Batch size must be divisible by world size"
+    seed = args.global_seed * world_size + rank
+    torch.manual_seed(seed)
+    torch.cuda.set_device(device)
+    print(f"Starting rank={rank}, seed={seed}, world_size={world_size}")
 
+    # setup an experiment folder
+    # TODO: maintain consistent argument flag attributes
+    experiment_index = args.experiment_index
+    experiment_dir = f"{args.results_dir}/{experiment_index}" # Create an experiment folder
+    checkpoint_dir = f"{experiment_dir}/checkpoints" # Directory for model checkpoints
+    sample_dir = f"{experiment_dir}/samples" # Inference directory for specific experiment
 
+    if rank == 0: # if master_process
+        os.makedirs(experiment_dir, exist_ok=True) # Make results folder, holds all sub folders
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(sample_dir, exist_ok=True)
+        logger = create_logger(experiment_dir) # creates log.txt in the experiment directory
+        logger.info(f"Experiment directory created at {experiment_dir}")
+    
+    # Create model:
+    assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
+    latent_size = args.image_size // 8
+    # instaniate model
+    model = create_model(args)
+    # Note that parameter initialization is done within the constructor of the model
+    ema = deepcopy(model).to(device) # create an EMA of the model for use after training
+    model = DDP(model.to(device), device_ids=[rank], find_unused_parameters=False)
+    flow = create_flow (
+        args.path_type,
+        args.prediction,
+        args.loss_weight,
+        args.train_eps,
+        args.sample_eps,
+        path_args = {
+            "diffusion_form" : args.diffusion_form,
+            "use_blurring" : args.use_blurring,
+            "blur_sigma_max" : args.blur_sigma_max,
+            "blur_upscale" : args.blur.upscale,
+        },
+        t_sample_mode = args.t_sample_mode,
+    ) # default: vector field / velocity
+
+    flow_sampler = Sampler(flow)
+    # Runtime VAE option incase latent are not precomputed
+    if not args.latents_precomputed:
+        vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    logger.info(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Setup Optimizer (default Adam Betas=(0.9, 0.999) and a constant learning rate 1e-4)
+    # TODO: Ablate weight decay regularization
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.max_epochs, verbose=True)
+
+    update_ema(ema, model.module, decay=0)    # Ensure EMA is inialized with synced weights
+
+    if args.model_ckpt and os.path.exists(args.model_ckpt):
+        checkpoint = torch.load(args.model_ckpt, map_location=torch.device(f"cuda:{device}"))
+        # TODO: Keep track of epoch consistency
+        epoch = int (os.path.split(args.model_ckpt)[-1].split(".")[0]) # ckpoints are saved checkpoint_dir/{epoch}.pt
+        init_epoch = 0
+
+        state_dict = model.module.state_dict()
+        for i, k in enumerate(["x_embedder.proj.weight", "final_layer.linear.weight", "final_layer.linear.bias"]):
+            # Note: Fixed for DiM-L/4 to DiM-L/2
+            if k in checkpoint["model"] and checkpoint["model"][k].shape != state_dict[k].shape:
+                if i == 0:
+                    K1, K2 = state_dict[k].shape[2:]
+                    checkpoint["model"][k] = checkpoint["model"][k][:, :, :K1, :K2] # state_dict[k]
+                    checkpoint["ema"][k] = checkpoint["ema"][k][:, :, :K1, :K2] # state_dict[k]
+                else:
+                    fan_in = state_dict[k].size(0)
+                    checkpoint["model"][k] = checkpoint["model"][k][:fan_in]
+                    checkpoint["ema"][k] = checkpoint["ema"][k][:fan_in]
+        
+        # interpolate position embedding to adapt pre trained pos embeddings to different input resolutions/sizes
+        interpolate_pos_embed(model.module, checkpoint["model"])
+        interpolate_pos_embed(ema, checkpoint["ema"])
+
+        msg = model.module.load_state_dict(checkpoint["model"], strict=True)
+        print (msg)
+
+        ema.load_state_dict(checkpoint["ema"])
+        optim.load_state_dict(checkpoint["opt"])
+        for g in optim.param_groups:
+            g["lr"] = args.lr
+
+        train_steps = 0
+
+        logger.info("=> loaded checkpoint (epoch {})".format(epoch))
+        del checkpoint
+
+    elif args.resume or os.path.exists(os.path.join(checkpoint_dir, "content.pth")):
+        checkpoint_file = 
 
     
 
