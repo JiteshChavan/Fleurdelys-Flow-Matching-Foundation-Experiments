@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 
 import torch
+import torch.nn as nn
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -273,6 +274,139 @@ def main (args):
     
     # disable gradient tracking on EMA model
     requires_grad(ema, False)
+
+    # TODO: Try streaming dataset instead if that's convenient
+    dataset = get_dataset(args)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.global_seed)
+    loader = DataLoader(
+        dataset,
+        batch_size=int(args.global_batch_size // world_size),
+        shuffle=False,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    logger.info(f"Dataset contains {len(dataset):,} images ({args.datadir})")
+
+    # Prepare models for training:
+    model.train()
+    ema.eval() # EMA model should always be in eval mode
+
+    # Variables for monitoring/logging:
+    log_steps = 0
+    running_loss = 0
+    start_time = time ()
+    # Class Label to condition on
+    use_label = True if "imagenet" in args.dataset else False
+
+    # TODO: Move this inside sampling loop, might be more convenient
+    # noise and label to run inference
+    # TODO: ARE WE EVEN USING THIS IN CELEBA? if not VAE then why 4 channel x0 ?
+    inference_bs = 2
+    # TODO: Figure out how it works for celeba, are we still using VAE latents
+    x_inference = torch.randn (inference_bs, 4, latent_size, latent_size, device=device) # (B, C, H, W)
+    y_inference = None if not use_label else torch.randint (low=0, high=args.num_classes, size=(inference_bs,), device=device) # None or (B)
+    use_cfg = args.cfg_scale > 1.0
+    # Setup classifier-free guidance:
+    if use_cfg:
+        x_inference = torch.cat((x_inference,x_inference), dim=0) # replicate the x0 for guided and unguided inference (2B, C, H, W)
+        y_null = torch.tensor ([args.num_classes] * inference_bs, device=device) #(B) class labels [0, num_classes) exclusive so num_classes is designed to be the null label
+        y_inference = torch.cat((y_inference, y_null), dim=0) # (2B)
+        inference_model_args = dict(y_inference=y_inference, cfg_scale = args.cfg_scale)
+        model_fn = ema.forward_with_cfg
+    else:
+        inference_model_args = dict (y_inference=y_inference)
+        model_fn = ema.forward
+
+    # TODO: verify consistency
+    use_latent = True if "latent" in args.dataset and args.latents_precomputed else False
+    logger.info (f"Training for {args.epochs} epochs...")
+
+    for epoch in range (init_epoch, args.epochs + 1):
+        sampler.set_epoch(epoch)
+        logger.info(f"Beinning epoch {epoch}...")
+        for i, (z, y) in tqdm(enumerate(loader)):
+            # adjust _learning_rate(optim, i / len(loader) + epoch, args)
+            x = x.to(device)
+            y = None if not use_label else y.to(device)
+
+            if not use_latent:
+                with torch.no_grad():
+                    # Map images to latent space + normalize latents:
+                    x = vae.encode(x).latent_dist.sample().mul_(0.18215) # (B, C, H, W)
+            model_args = dict (y=y)
+            memory_before_forward = torch.cuda.memory_allocated(device)
+            loss_dict = flow.training_losses(model, x, model_args)
+            loss = loss_dict["loss"].mean()
+            memory_after_forward = torch.cuda.memory_allocated(device)
+            optim.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+            optim.step()
+            memory_after_backward = torch.cuda.memory_allocated(device)
+            update_ema(ema, model.module)
+
+            # Log loss values:
+            running_loss += loss.item()
+            log_steps += 1
+            train_steps += 1
+            if train_steps % args.log_every == 0:
+                # Measure training speed:
+                torch.cuda.synchronize()
+                end_time = time()
+                steps_per_sec = log_steps / (end_time - start_time) # average velocity (total steps / total time)
+                # Reduce loss history over all processes:
+                avg_loss = torch.tensor(running_loss / log_steps, device = device)
+                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                avg_loss = avg_loss.item() / world_size
+                logger.info(
+                    f"(step={train_steps:08d}) Train loss: {avg_loss:.4f}, "
+                    f"Train Steps/Sec: {steps_per_sec:.2f}, "
+                    f"GPU Mem before forward: {memory_before_forward/10**9:.2f}GB, "
+                    f"GPU Mem after forward: {memory_after_forward/10**9:.2f}GB, "
+                    f"GPU Mem after backward: {memory_after_backward/10**9:.2f}GB, "
+                )
+
+                # Reset monitoring variables:
+                runing_loss = 0
+                log_steps = 0
+                start_time = time()
+        
+        if rank == 0: # if master_process
+            # latest checkpoint
+            if epoch % args.save_content_every == 0:
+                logger.info("Saving content.")
+                content = {
+                    "epoch" : epoch + 1, # eoch to resume from
+                    "train_steps" : train_steps,
+                    "args" : args,
+                    "model" : model.module.state_dict(),
+                    "optim" : optim.state_dict(),
+                    "ema" : ema.state_dict(),
+                }
+                torch.save(content, os.path.join(checkpoint_dir, "content.pth"))
+            
+            if epoch % args.ckpt_every == 0 and epoch > 0:
+                checkpoint = {
+                    "epoch" : epoch + 1,    # next epoch upon resuming
+                    "model" : model.module.state_dict(),
+                    "ema" : ema.state_dict(),
+                    "optim" : optim.state_dict(),
+                    "args" : args,
+                }
+                checkpoint_path = f"{checkpoint_dir}/{epoch:08d}.pt"
+                torch.save (checkpoint, checkpoint_path)
+                logger.info(f"Saved checkpoint to {checkpoint_path}")
+        
+        if rank == 0 and epoch % args.plot_every == 0:
+            logger.info("Generating EMA samples...")
+            
+
+            
+
+
 
 
     
