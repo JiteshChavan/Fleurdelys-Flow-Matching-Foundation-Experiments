@@ -35,6 +35,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.utils import save_image
 
+# Flow matching
 from flow import Sampler, create_flow
 
 # for easy imports from eval toolbox
@@ -117,6 +118,7 @@ def center_crop_arr (pil_image, image_size):
 
 
 # TODO : Ablation linear warmup that starts at 1 / warmup, change if doesnt work out
+# TODO: Change lr to max_lr in args
 def adjust_learning_rate (optimizer, epoch, args):
     """Decay the learning rate with half-cycle cosine after linear warmup"""
     if epoch < args.warmup_epochs:
@@ -203,7 +205,7 @@ def main (args):
     # Runtime VAE option incase latent are not precomputed
     if not args.latents_precomputed:
         vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-    logger.info(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    logger.info(f"Backbone Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup Optimizer (default Adam Betas=(0.9, 0.999) and a constant learning rate 1e-4)
     # TODO: Ablate weight decay regularization
@@ -214,7 +216,7 @@ def main (args):
 
     if args.model_ckpt and os.path.exists(args.model_ckpt):
         checkpoint = torch.load(args.model_ckpt, map_location=torch.device(f"cuda:{device}"))
-        # TODO: Keep track of epoch consistency
+        # TODO: Keep track of epoch vs init_epcoh consistency
         epoch = int (os.path.split(args.model_ckpt)[-1].split(".")[0]) # ckpoints are saved checkpoint_dir/{epoch}.pt
         init_epoch = 0
 
@@ -231,7 +233,7 @@ def main (args):
                     checkpoint["model"][k] = checkpoint["model"][k][:fan_in]
                     checkpoint["ema"][k] = checkpoint["ema"][k][:fan_in]
         
-        # interpolate position embedding to adapt pre trained pos embeddings to different input resolutions/sizes
+        # interpolate position embedding to adapt pos embeddings to different input resolutions/sizes
         interpolate_pos_embed(model.module, checkpoint["model"])
         interpolate_pos_embed(ema, checkpoint["ema"])
 
@@ -239,9 +241,9 @@ def main (args):
         print (msg)
 
         ema.load_state_dict(checkpoint["ema"])
-        optim.load_state_dict(checkpoint["opt"])
+        optim.load_state_dict(checkpoint["optim"])
         for g in optim.param_groups:
-            g["lr"] = args.lr
+            g["lr"] = args.max_lr
 
         train_steps = 0
 
@@ -249,7 +251,29 @@ def main (args):
         del checkpoint
 
     elif args.resume or os.path.exists(os.path.join(checkpoint_dir, "content.pth")):
-        checkpoint_file = 
+        # resume training
+        checkpoint_file = os.path.join(checkpoint_dir, "content.pth")
+        checkpoint = torch.load(checkpoint_file, map_location=torch.device(f"cuda:{device}"))
+        init_epoch = checkpoint["epoch"]
+        epoch = init_epoch
+        model.module.load_state_dict(checkpoint["model"])
+        optim.load_state_dict(checkpoint["optim"])
+        ema.load_state_dict(checkpoint["ema"])
+        train_steps = checkpoint["train_steps"]
+
+        for g in optim.param_groups:
+            g["lr"] = args.max_lr
+        
+        logger.info("=> resume checkpoint (epoch {})".format(checkpoint["epoch"]))
+        del checkpoint
+    else:
+        # clean training run : no checkpoint resume or pretrained weights
+        init_epoch = 0
+        train_steps = 0
+    
+    # disable gradient tracking on EMA model
+    requires_grad(ema, False)
+
 
     
 
