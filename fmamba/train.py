@@ -210,7 +210,7 @@ def main (args):
 
     # Setup Optimizer (default Adam Betas=(0.9, 0.999) and a constant learning rate 1e-4)
     # TODO: Ablate weight decay regularization
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
+    optim = torch.optim.AdamW(model.parameters(), lr=args.max_lr, weight_decay=0)
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.max_epochs, verbose=True)
 
     update_ema(ema, model.module, decay=0)    # Ensure EMA is inialized with synced weights
@@ -280,7 +280,7 @@ def main (args):
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.global_seed)
     loader = DataLoader(
         dataset,
-        batch_size=int(args.global_batch_size // world_size),
+        batch_size=int(args.global_batch_size // world_size), # 8B % 8 = 0 
         shuffle=False,
         sampler=sampler,
         num_workers=args.num_workers,
@@ -290,12 +290,12 @@ def main (args):
     logger.info(f"Dataset contains {len(dataset):,} images ({args.datadir})")
 
     # Prepare models for training:
-    model.train()
+    model.train() # this implementation uses dropout for disabling guidance, for unguided training for CFG, not recommended
     ema.eval() # EMA model should always be in eval mode
 
     # Variables for monitoring/logging:
     log_steps = 0
-    running_loss = 0
+    running_loss = torch.tensor(0.0, device=device)
     start_time = time ()
     # Class Label to condition on
     use_label = True if "imagenet" in args.dataset else False
@@ -308,15 +308,15 @@ def main (args):
     x_inference = torch.randn (inference_bs, 4, latent_size, latent_size, device=device) # (B, C, H, W)
     y_inference = None if not use_label else torch.randint (low=0, high=args.num_classes, size=(inference_bs,), device=device) # None or (B)
     use_cfg = args.cfg_scale > 1.0
-    # Setup classifier-free guidance:
+    # Setup classifier-free guidance for inference (this is not for FID eval):
     if use_cfg:
         x_inference = torch.cat((x_inference,x_inference), dim=0) # replicate the x0 for guided and unguided inference (2B, C, H, W)
         y_null = torch.tensor ([args.num_classes] * inference_bs, device=device) #(B) class labels [0, num_classes) exclusive so num_classes is designed to be the null label
         y_inference = torch.cat((y_inference, y_null), dim=0) # (2B)
-        inference_model_args = dict(y_inference=y_inference, cfg_scale = args.cfg_scale)
+        inference_model_args = dict(y=y_inference, cfg_scale = args.cfg_scale)
         model_fn = ema.forward_with_cfg
     else:
-        inference_model_args = dict (y_inference=y_inference)
+        inference_model_args = dict (y=y_inference)
         model_fn = ema.forward
 
     # TODO: verify consistency
@@ -326,8 +326,10 @@ def main (args):
     for epoch in range (init_epoch, args.epochs + 1):
         sampler.set_epoch(epoch)
         logger.info(f"Beinning epoch {epoch}...")
-        for i, (z, y) in tqdm(enumerate(loader)):
-            # adjust _learning_rate(optim, i / len(loader) + epoch, args)
+        for i, (x, y) in tqdm(enumerate(loader)):
+            # for all intents and purposes since we arent doing gradient accumulation, batch_size might as well be world_size * local_batch_size
+            # and each backward syncs gradients for batch_size 8B
+            # adjust _learning_rate(optim, i / len(loader) + epoch, args) # len loader = len(dataset) / (world_size * local_batch_size)
             x = x.to(device)
             y = None if not use_label else y.to(device)
 
@@ -341,7 +343,7 @@ def main (args):
             loss = loss_dict["loss"].mean()
             memory_after_forward = torch.cuda.memory_allocated(device)
             optim.zero_grad()
-            loss.backward()
+            loss.backward() # by default requires_backward_grad_sync is true for DDP; so every replica has synchronized gradients (basically averaged gradients) g(L)/8 for all i
             nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             optim.step()
@@ -349,7 +351,7 @@ def main (args):
             update_ema(ema, model.module)
 
             # Log loss values:
-            running_loss += loss.item()
+            running_loss += loss.detach() # equivalent to loss.detach() for logging, (stops gradient tracking)
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -358,11 +360,12 @@ def main (args):
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time) # average velocity (total steps / total time)
                 # Reduce loss history over all processes:
-                avg_loss = torch.tensor(running_loss / log_steps, device = device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / world_size
+                running_loss = running_loss / log_steps
+                # avg_loss = torch.tensor(running_loss / log_steps, device = device)
+                dist.all_reduce(running_loss, op=dist.ReduceOp.AVG)
+                #avg_loss = avg_loss.item() / world_size
                 logger.info(
-                    f"(step={train_steps:08d}) Train loss: {avg_loss:.4f}, "
+                    f"(step={train_steps:08d}) Train loss: {running_loss:.4f}, "
                     f"Train Steps/Sec: {steps_per_sec:.2f}, "
                     f"GPU Mem before forward: {memory_before_forward/10**9:.2f}GB, "
                     f"GPU Mem after forward: {memory_after_forward/10**9:.2f}GB, "
@@ -370,7 +373,7 @@ def main (args):
                 )
 
                 # Reset monitoring variables:
-                runing_loss = 0
+                running_loss.zero_()
                 log_steps = 0
                 start_time = time()
         
@@ -379,7 +382,7 @@ def main (args):
             if epoch % args.save_content_every == 0:
                 logger.info("Saving content.")
                 content = {
-                    "epoch" : epoch + 1, # eoch to resume from
+                    "epoch" : epoch + 1, # epoch to resume from
                     "train_steps" : train_steps,
                     "args" : args,
                     "model" : model.module.state_dict(),
@@ -388,6 +391,7 @@ def main (args):
                 }
                 torch.save(content, os.path.join(checkpoint_dir, "content.pth"))
             
+            # save model checkpoint
             if epoch % args.ckpt_every == 0 and epoch > 0:
                 checkpoint = {
                     "epoch" : epoch + 1,    # next epoch upon resuming
@@ -402,10 +406,244 @@ def main (args):
         
         if rank == 0 and epoch % args.plot_every == 0:
             logger.info("Generating EMA samples...")
+            with torch.no_grad():
+                sample_fn = flow.sampler.sample_ode() # Default to ODE simulation to trace flows
+                # TODO: cryptic change implementation for better readability
+                # i dont like this implementation, where we send x0,y and x0,null
+                # separately by construction to the ODE solver, makes it cryptic
+                # better have a single function forward, looks at cfg scale if not 1.0, replicates and stacks caption or null,
+                # then calls forward with cfg and forward without cfg on them, combines with cfg forward pass
+                # gets the velocity and takes a small step in that direction
+                samples = sample_fn(x_inference, model_fn, **inference_model_args)[-1] # TODO: look into design decision for [-1] access
+                if use_cfg: # remove null samples; Gnarly, I dont like this
+                    samples, _ = samples.chunk(2, dim=0)
+                # TODO: VAE consistency
+                samples = vae.decode(samples / 0.18215).sample
             
+            # Save and display images:
+            save_image(samples, f"{sample_dir}/image_{epoch:.08d}.jpg", nrow=4, normalize=True, value_range=(-1,1))
+            del samples
+        
+        # Run eval once in a while
+        if epoch % args.eval_every == 0 and epoch > 0:
+            ref_dir = Path(args.eval_refdir)
+            if ref_dir.exists():
+                # TODO: mandate consistent flags
+                eval_batch_size = args.eval_batch_size
+                using_cfg = args.eval_cfg_scale > 1.0
+                global_batch_size = eval_batch_size * world_size
+                # total samples = next multiple of global batch size
+                total_samples = int(math.ceil(args.n_eval_samples / global_batch_size) * global_batch_size)
+                samples_needed_this_gpu = int (total_samples // world_size)
+                iterations = int (samples_needed_this_gpu // eval_batch_size)
+                pbar = range(iterations)
+                pbar = tqdm(pbar) if rank == 0 else pbar
+                total = 0
+                p = Path(experiment_dir) / f"fid{args.n_eval_samples}_epoch{epoch}"
+                # if p.exists() and rank == 0:
+                #   shutil.rmtree(p.as_posix())
+                p.mkdir(exist_ok=True, parents=True)
 
-            
+                model.eval()
+                for _ in pbar:
+                    # Sample inputs:
+                    eval_x = torch.randn(eval_batch_size, 4, latent_size, latent_size, device=device) # (B, C, H, W)
+                    eval_y = None if not use_label else torch.randint (low=0, high=args.num_classes, size=(eval_batch_size,), device=device) # (B)
+                    # Setup classifier free guidance for FID/Eval:
+                    if use_cfg:
+                        eval_x = torch.cat((eval_x,eval_x), dim=0) #(2B, C, H, W)
+                        y_null = torch.tensor([args.num_classes] * eval_batch_size, device=device) #(B)
+                        eval_y = torch.cat((eval_y, y_null), dim=0) #(2B)
+                        eval_model_args = dict (y = eval_y, cfg_scale=args.eval_cfg_scale)
+                        eval_model_fn = ema.forward_with_cfg # model.forward_with_cfg
+                    else:
+                        eval_model_args = dict (y=eval_y)
+                        eval_model_fn = ema.forward # model.forward
+                    
+                    # Sample images:
+                    with torch.no_grad():
+                        sample_fn = flow_sampler.sample_ode() # default to ODE sampling
+                        samples = sample_fn(eval_x, eval_model_fn, eval_model_args)[-1] # TODO: look into design decision for [-1] access
+                    
+                    # discard null class (unguided) samples
+                    if using_cfg:
+                        samples, _ = samples.chunk(2, dim=0)
+                    
+                    # TODO: mandate VAE consistency
+                    samples = vae.decode(samples / 0.18215).sample
+                    samples = (
+                        # TODO: FIX: the ablation to inversal to follow the repo
+                        torch.clamp ((samples + 1.0) * 127.5, 0, 255)
+                        .permute(0, 2, 3, 1) #(B, H, W, C)
+                        .to("cpu", dtype=torch.uint8)
+                        .numpy()
+                    )
+                    
+                    # Save samples to disk as individual .png files
+                    for i, sample in enumerate(samples):
+                        index = i * world_size + rank + total
+                        if index >= args.n_eval_samples:
+                            break
+                        pp = p / f"{index:06d}.jpg"
+                        Image.fromarray(sample).save(pp.as_posix())
+                    total += global_batch_size
+                
+                model.train()
+                eval_args = dnnlib.EasyDict()
+                # reference images
+                eval_args.dataset_kwargs = dnnlib.EasyDict(
+                    class_name="training.dataset.ImageFolderDataset",
+                    path=ref_dir.as_posix(),
+                    xflip=True,
+                )
+                # generated images
+                eval_args.gen_dataset_kwargs = dnnlib.EasyDict(
+                    class_name="training.dataset.ImageFolderDataset",
+                    path=p.resolve().as_posix(),
+                    xflip=True,
+                )
+                progress = metric_utils.ProgressMonitor(verbose=True)
+                if rank == 0: # if master_process
+                    print("Calculating FID...")
+                result_dict = metric_main.calc_metric(
+                    metric="fid2k_full",
+                    dataset_kwargs=eval_args.dataset_kwargs,
+                    num_gpus=world_size,
+                    rank=rank,
+                    device=device,
+                    progress=progress,
+                    gen_dataset_kwargs=eval_args.gen_dataset_kwargs,
+                    cache=True,
+                )
 
+                if rank == 0:
+                    metric_main.report_metric(result_dict, run_dir=experiment_dir, snapshot_pkl=p.as_posix())
+                del result_dict, samples
+                gc.collect()
+                torch.cuda.empty_cache()
+            else:
+                print(f"Reference directory {ref_dir} does not exists, skipping eval...")
+            dist.barrier()
+    
+    model.eval() #important! This disables randomized embedding dropout, hack for CFG unguided training
+    # do any sampling/FID calcs with EMA or model in eval mode...
+    logger.infor("Done!")
+    cleanup()
+
+
+def none_or_str(value):
+    if value == "None":
+        return None
+    return value
+
+
+if __name__ == "__main__":
+    # Default args here will train the model with the hyperparameters we used in our paper (except training iters).
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", default="cifar10", help="name of dataset")
+    parser.add_argument("--exp", type=str, required=True)
+    parser.add_argument("--datadir", type=str, required=True)
+    parser.add_argument("--results-dir", type=str, default="results")
+    parser.add_argument("--model", type=str, default="MambaDiffV1_XL_2")
+    parser.add_argument("--image-size", type=int, choices=[256, 512, 1024], default=256)
+    parser.add_argument("--num-in-channels", type=int, default=4)
+    parser.add_argument("--num-classes", type=int, default=0)
+    parser.add_argument("--cfg-scale", type=float, default=1.0)
+    parser.add_argument("--label-dropout", type=float, default=-1)
+    parser.add_argument("--epochs", type=int, default=1400)
+    parser.add_argument("--global-batch-size", type=int, default=256)
+    parser.add_argument("--global-seed", type=int, default=0)
+    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--ckpt-every", type=int, default=25)
+    parser.add_argument("--save-content-every", type=int, default=5)
+    parser.add_argument("--plot-every", type=int, default=5)
+    parser.add_argument("--model-ckpt", type=str, default="")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--learn-sigma", action="store_true")
+    parser.add_argument(
+        "--bimamba-type",
+        type=str,
+        default="v2",
+        choices=["v2", "none", "zigma_8", "sweep_8", "jpeg_8", "sweep_4", "jpeg_2"],
+    )
+    parser.add_argument("--cond-mamba", action="store_true")
+    parser.add_argument("--scanning-continuity", action="store_true")
+    parser.add_argument("--enable-fourier-layers", action="store_true")
+    parser.add_argument("--rms-norm", action="store_true")
+    parser.add_argument("--fused-add-norm", action="store_true")
+    parser.add_argument("--drop-path", type=float, default=0.0)
+    parser.add_argument("--use-final-norm", action="store_true")
+    parser.add_argument(
+        "--use-attn-every-k-layers",
+        type=int,
+        default=-1,
+    )
+    parser.add_argument("--not-use-gated-mlp", action="store_true")
+    # parser.add_argument("--skip", action="store_true")
+    parser.add_argument("--max-lr", type=float, default=1e-4)
+    parser.add_argument("--pe-type", type=str, default="ape", choices=["ape", "cpe", "rope"])
+    parser.add_argument("--learnable-pe", action="store_true")
+    parser.add_argument(
+        "--block-type",
+        type=str,
+        default="linear",
+        choices=["linear", "raw", "wave", "combined", "window", "combined_fourier", "combined_einfft"],
+    )
+    parser.add_argument("--no-lr-decay", action="store_true", default=False)
+    parser.add_argument(
+        "--min-lr",
+        type=float,
+        default=1e-6,
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=5,
+    )
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=2.0,
+    )
+
+    group = parser.add_argument_group("Eval")
+    group.add_argument("--eval-every", type=int, default=100)
+    group.add_argument("--eval-refdir", type=str, default=None)
+    group.add_argument("--n-eval-samples", type=int, default=1000)
+    group.add_argument("--eval-batch-size", type=int, default=4)
+    group.add_argument("--eval-cfg-scale", type=float, default=1.0)
+
+    group = parser.add_argument_group("MoE arguments")
+    group.add_argument("--num-moe-experts", type=int, default=8)
+    group.add_argument("--mamba-moe-layers", type=none_or_str, nargs="*", default=None)
+    group.add_argument("--is-moe", action="store_true")
+    group.add_argument(
+        "--routing-mode", type=str, choices=["sinkhorn", "top1", "top2", "sinkhorn_top2"], default="top1"
+    )
+    group.add_argument("--gated-linear-unit", action="store_true")
+
+    group = parser.add_argument_group("Transport arguments")
+    group.add_argument("--path-type", type=str, default="Linear", choices=["Linear", "GVP", "VP"])
+    group.add_argument("--prediction", type=str, default="velocity", choices=["velocity", "score", "noise"])
+    group.add_argument("--loss-weight", type=none_or_str, default=None, choices=[None, "velocity", "likelihood"])
+    group.add_argument("--sample-eps", type=float)
+    group.add_argument("--train-eps", type=float)
+    group.add_argument(
+        "--diffusion-form",
+        type=str,
+        default="none",
+        choices=["none", "constant", "SBDM", "sigma", "linear", "decreasing", "increasing-decreasing", "log"],
+        help="form of diffusion coefficient in the SDE",
+    )
+    group.add_argument("--t-sample-mode", type=str, default="uniform")
+    group.add_argument("--use-blurring", action="store_true")
+    group.add_argument("--blur-sigma-max", type=int, default=3)
+    group.add_argument("--blur-upscale", type=int, default=4)
+
+    args = parser.parse_args()
+    main(args)
 
 
 
