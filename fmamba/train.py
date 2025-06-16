@@ -404,6 +404,7 @@ def main (args):
                 torch.save (checkpoint, checkpoint_path)
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
         
+        # run inference once in a while
         if rank == 0 and epoch % args.plot_every == 0:
             logger.info("Generating EMA samples...")
             with torch.no_grad():
