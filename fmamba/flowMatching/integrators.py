@@ -17,7 +17,9 @@ class sde:
         assert t0 < t1, "Flow convention is t0 (for pinit) < t1 (for pdata)"
 
         self.num_timesteps = num_steps
-        self.t = torch.linspace(t0, t1, num_steps)
+        # TODO: Made a change over here for intuitive interfacing with the class from outside
+        # linspace has to be specified num_t_points
+        self.t = torch.linspace(t0, t1, num_steps+1)
         self.dt = self.t[1] - self.t[0]
         self.drift = drift
         self.diffusion = diffusion
@@ -78,3 +80,44 @@ class sde:
                 samples.append(x)
         return samples
 
+class ode:
+    """ODE solver class"""
+
+    def __init__(
+            self,
+            drift,
+            *,
+            t0,
+            t1,
+            sampler_type,
+            num_steps,
+            atol,
+            rtol,
+    ):
+        assert t0 < t1, "Flow convention is t0 (for pinit) < t1 (for pdata)"
+
+        self.drift = drift
+        # TODO: Again same rectification for intuitive interface
+        # linspace has to be specified tpoints, not num_steps
+        self.t = torch.linspace(t0, t1, num_steps+1)
+        self.atol = atol
+        self.rtol = rtol
+        self.sampler_type = sampler_type
+
+    def sample (self, x, model, **model_args):
+        device = x[0].device if isinstance(x, tuple) else x.device
+
+        def _fn (t, x):
+            t = torch.ones(x[0].size(0)).to(device) * t if isinstance(x, tuple) else torch.ones(x.size(0)).to(device) * t
+            model_output = self.drift(x, t, model, **model_args)
+            return model_output
+
+        t = self.t.to(device)
+        atol = [self.atol] * len(x) if isinstance(x, tuple) else [self.atol]
+        rtol = [self.rtol] * len(x) if isinstance(x, tuple) else [self.rtol]
+        samples = odeint(_fn, x, t, method=self.sampler_type, atol=atol, rtol=rtol)
+        return samples
+
+
+
+        
