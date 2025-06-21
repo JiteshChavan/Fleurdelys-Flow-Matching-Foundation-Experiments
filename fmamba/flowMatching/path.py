@@ -66,9 +66,9 @@ class ICPlan:
         # idk why we are pretending that coeff of conditional score is called diffusion
         # idk why the heck we are returning negative of coefficient of x in the score parametrization, in formula its clearly addition
         drift = alpha_ratio * x
-        diffusion = alpha_ratio * (beta_t**2) - beta_t * beta_t_dot
+        score_coefficient = alpha_ratio * (beta_t**2) - beta_t * beta_t_dot
         # why stray away from mathematical convention and negate for reason
-        return -drift, diffusion
+        return drift, score_coefficient
     
     # not to be confused with what they call diffusion above lol
     # looks like diffusion coefficient sigma_t
@@ -172,7 +172,19 @@ class ICPlan:
         noise = (reverse_alpha_ratio* vector_field - mean) / var
         return noise
     
-    
+    def get_vector_field_from_score (self, score, x, t):
+        """Transform score model to VectorField model
+        Args:
+            score: (B, ...), score model output
+            x: (B, ...), x_t data point the trajectory at time t
+            t: (B,) time
+        """
 
+        t = expand_t_like_x(t, x)
+        x_term, score_coefficient = self.compute_drift(x, t)
+        vectorField = score_coefficient * score + x_term
+        return vectorField
     
+    def compute_mu_t (self, t, x0, x1):
+        """Compute the mean of along the conditional probability path p_t(.|z)"""
     
