@@ -186,5 +186,56 @@ class ICPlan:
         return vectorField
     
     def compute_mu_t (self, t, x0, x1):
-        """Compute the mean of along the conditional probability path p_t(.|z)"""
+        """Compute the mean along the conditional probability path p_t(.|z) at time t
+            Mean is all we want for flow/vectorfield models, no noise injection
+        """
+        t = expand_t_like_x (t, x1) # (B, 1, 1, 1)
+        alpha_t, _ = self.compute_alpha_t(t) # (B, 1, 1, 1)
+        beta_t, _ = self.compute_beta_t(t) # (B, 1, 1, 1)
+
+        if self.use_blurring:
+            blur_sigmas = (
+                self.blur_sigma_max * torch.sin(beta_t * torch.pi / 2) ** 2 # same shape as beta_t (B, 1, 1, 1)
+            ) # higher blurring intensity near t=0 (since beta_t(0) = 1) to stabilize training and reducing variance
+            # near t=0, the task is to yield a vector field that describes an ODE, upon simulating this ODE, xt follows pt(x|z)
+            # xt is linear interpolation between x0 and x1 (or z)
+            # x0 is a sample from N(0, Id) and x1 is full of detailed structure and high frequencies, this results in high variance and unstable training for various examples
+            # this mismatch can cause difficulty in learning stable vector field that meaningfully connects x0 and x1
+            # blurring x1 for early time steps removes high frequency, structure/details from x1 and preserves general bare representation of pdata
+            # result : less variance when yielding a vectorfield for different examples starting at t=0 and x~N(0,Id)
+            # hence stronger blurring near t=0, no blurring near t=1
+            x1 = DCTBlur (x1, self.blur_upscale, blur_sigmas, 1e-3, x1.device) # (B, C, H, W) # blur_upscale is the scale of blurring, (DCT block patch size), image divided into non overlapping patches. Larger patch size -> (aggressive freq filtering)coarse scale of blurring
+
+            # increaing patch_size -> increasing scale of blurring hence the name "upscale"
+
+        return alpha_t * x1 + beta_t * x0 # alpha_t * z + beta_t * eps (eps~N(0,Id)) (B, C, H, W)
+
+def DCTBlur (x, patch_size, blur_sigmas, min_scale, device):
+    blur_sigmas = torch.as_tensor(blur_sigmas).to(device) # (B, 1, 1, 1)
+    freqs = torch.pi * torch.linspace(0, patch_size - 1, patch_size).to(device) / patch_size # (patch_size,)
     
+    # create a 2D grid of squared DCT frequencies, gridwise addition of frequencies, each element has information of row and column
+    # precompute frequency magnitudes per DCT bin, which is (the grid is repeated) then repeated resolution / patch size times
+    
+    # shape: (patch_size, patch_size)
+    frequencies_squared = freqs[:, None] ** 2 + freqs[None, :] ** 2 # its just freqs.unsqueeze(1) ** 2 + freqs.unsqueeze(0) ** 2
+
+    t = (blur_sigmas**2) / 2 # (B, 1, 1, 1)
+
+    dct_coeffs = dct_2d (x, patch_size, norm="ortho") # (B, C, H, W)
+    scale = x.shape[-1] // patch_size
+    freq_grid = frequencies_squared.repeat(scale, scale) # (H, W)
+    # just to be explicit (not required) again this will break if x is B, T, C that comes out of patch embedder but probably isnt
+    # because grid is H, W blurring is pre processing before backbone
+    # better leave it to implicit broadcasting
+    # freq_grid = freq_grid.unsqueeze(0).unsqueeze(0) #(1, 1, H, W)
+
+    # attenuate based on frequency components, attenuation mask is 1 for low frequencies, and 0 for HF components in the DCT bin grid
+    # freq_grid : (H, W), t : (B, 1, 1, 1)
+    attenuation = torch.exp(-freq_grid * t) # (B, 1, H, W)
+    # linear interpolation between min_scale and attenuation, so that we dont kill off frequency components completely
+    # soft floor trick, to preserve lower frequencies, so that attenuation is [min_scale, 1]
+    attenuation = attenuation * (1 - min_scale) +  min_scale
+    # scale the freq representation of the image with the attenuation mask
+    dct_coeffs = dct_coeffs * attenuation
+    return idct_2d (dct_coeffs, patch_size, norm="ortho") # (B, C, H, W)
