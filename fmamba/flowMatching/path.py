@@ -229,6 +229,33 @@ class ICPlan:
         ut_target = self.compute_ut_target(t, x0, x1, xt)
         return t, xt, ut_target
 
+class VPCPlan (ICPlan):
+    """VP Path for Flow Matching"""
+
+    def __init__(self, sigma_min=0.1, sigma_max=20.0, **kwargs):
+        super().__init__(**kwargs)
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        # basically non linear alpha_t and beta_t
+        self.log_mean_coeff = (
+            lambda t: -0.25 * ((1-t)**2) * (self.sigma_max - self.sigma_min) - 0.5 * (1-t) * self.sigma_min
+        )
+        self.d_log_mean_coeff = lambda t: 0.5 * (1-t) * (self.sigma_max - self.sigma_min) + 0.5 * self.sigma_min
+    
+    def compute_alpha_t(self, t):
+        """Coefficient of Z"""
+        log_alpha_t = self.log_mean_coeff(t)
+        alpha_t = torch.exp(log_alpha_t) # derivative of e^f(x) = e^f(x) * f'(x)
+        alpha_t_dot = alpha_t * self.d_log_mean_coeff(t)
+        return alpha_t, alpha_t_dot
+    
+    def compute_beta_t(self, t):
+        """Coefficient of X0 (or eps)"""
+        p_beta_t = 2 * self.log_mean_coeff(t)
+        beta_t = torch.sqrt(1 - torch.exp(p_beta_t))
+        beta_t_dot = torch.exp(p_beta_t) * (2 * self.d_log_mean_coeff(t)) / (-2 * beta_t)
+        return beta_t, beta_t_dot
+
 def DCTBlur (x, patch_size, blur_sigmas, min_scale, device):
     blur_sigmas = torch.as_tensor(blur_sigmas).to(device) # (B, 1, 1, 1)
     freqs = torch.pi * torch.linspace(0, patch_size - 1, patch_size).to(device) / patch_size # (patch_size,)
