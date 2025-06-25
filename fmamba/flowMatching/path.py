@@ -215,7 +215,7 @@ class ICPlan:
         xt = self.compute_mu_t(t, x0, x1) # (B, C, H, W) alpha_t * z + beta_t * eps
         return xt
     
-    def compute_ut (self, t, x0, x1, xt):
+    def compute_ut_target (self, t, x0, x1, xt):
         """Compute conditional vector field ut_target(xt) for Gaussian Probability Path"""
         t = expand_t_like_x(t, xt)
         _, alpha_t_dot = self.compute_alpha_t(t)
@@ -223,6 +223,11 @@ class ICPlan:
 
         ut_target = alpha_t_dot * x1 + beta_t_dot * x0
         return ut_target
+    
+    def plan (self, t, x0, x1):
+        xt = self.compute_xt(t, x0, x1)
+        ut_target = self.compute_ut_target(t, x0, x1, xt)
+        return t, xt, ut_target
 
 def DCTBlur (x, patch_size, blur_sigmas, min_scale, device):
     blur_sigmas = torch.as_tensor(blur_sigmas).to(device) # (B, 1, 1, 1)
