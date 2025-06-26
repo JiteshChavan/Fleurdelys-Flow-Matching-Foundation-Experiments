@@ -274,6 +274,27 @@ class VPCPlan (ICPlan):
         sigma_t = self.sigma_min + (1 - t) * (self.sigma_max - self.sigma_min)
         return -0.5 * sigma_t * x, sigma_t / 2
 
+# General Variance Preserving Conditional Path
+class GVPCPlan (ICPlan):
+    def __init__(self, sigma=0.0, **kwargs):
+        super().__init__(sigma, **kwargs)
+    
+    def compute_alpha_t (self, t):
+        "Coefficient of Z (or X1)"
+        alpha_t = torch.sin(t * np.pi / 2)
+        alpha_t_dot = (np.pi / 2) * torch.cos(t * np.pi / 2)
+        return alpha_t, alpha_t_dot
+    
+    def compute_beta_t(self, t):
+        """Coefficient of X0 (or eps)"""
+        beta_t = torch.cos(t * np.pi/2)
+        beta_t_dot = -np.pi/2 * torch.sin(t * np.pi/2)
+        return beta_t, beta_t_dot
+    
+    def compute_d_alpha_alpha_ratio_t(self, t):
+        """Numerically stable alpha_t_dot/alpha_t"""
+        return np.pi / (2 * torch.tan(t * np.pi / 2))
+
 def DCTBlur (x, patch_size, blur_sigmas, min_scale, device):
     blur_sigmas = torch.as_tensor(blur_sigmas).to(device) # (B, 1, 1, 1)
     freqs = torch.pi * torch.linspace(0, patch_size - 1, patch_size).to(device) / patch_size # (patch_size,)
