@@ -252,9 +252,27 @@ class VPCPlan (ICPlan):
     def compute_beta_t(self, t):
         """Coefficient of X0 (or eps)"""
         p_beta_t = 2 * self.log_mean_coeff(t)
-        beta_t = torch.sqrt(1 - torch.exp(p_beta_t))
+        beta_t = torch.sqrt(1 - torch.exp(p_beta_t)) # root(1 - alpha_t^2)
         beta_t_dot = torch.exp(p_beta_t) * (2 * self.d_log_mean_coeff(t)) / (-2 * beta_t)
         return beta_t, beta_t_dot
+    
+    def compute_d_alpha_alpha_ratio_t (self, t):
+        """Numerically stable way to compute alpha_t_dot / alpha_t ratio
+            relies on the closed form and well behaved derivative of log schedule
+            alpha_t = exp(k), alpha_t_dot = exp(k) * k_dot
+            ratio is simply k_dot which is analytically tractable in a numerically stable way, near both t = 0 and t = 1
+
+            the idea is that we refer to the variable k as log alpha_t, so we exponentiate it to get alpha_t,
+            t = 0, alpha_t = 0 which might cause numericaly instability in the ratio, but thanks to derivatives of exponents getting cancelled,
+            it doesnt cause any problems.
+        """
+        return self.d_log_mean_coeff(t)
+    
+    def compute_drift (self, x, t):
+        """Compute the drift term of the SDE"""
+        t = expand_t_like_x(t, x)
+        sigma_t = self.sigma_min + (1 - t) * (self.sigma_max - self.sigma_min)
+        return -0.5 * sigma_t * x, sigma_t / 2
 
 def DCTBlur (x, patch_size, blur_sigmas, min_scale, device):
     blur_sigmas = torch.as_tensor(blur_sigmas).to(device) # (B, 1, 1, 1)
