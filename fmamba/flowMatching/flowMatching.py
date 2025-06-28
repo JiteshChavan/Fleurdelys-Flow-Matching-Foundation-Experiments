@@ -83,4 +83,46 @@ class FlowMatching:
         
         return torch.vmap(_fn)(z)    # returns shape (B,) log likelihood of all examples under N(0, Id)
     
+    def check_interval(
+            self,
+            train_eps,
+            sample_eps,
+            *,
+            diffusion_form="SBDM", # Score Based Diffusion Model
+            sde=False,
+            reverse=False,
+            eval=False,
+            last_step_size=0.0,
+    ):
+        t0=0
+        t1=1 # basically we make no changes if its linear condOT variant construction and ODE and the model is vectorfield lol
+        # however we do make changes if its linear CondOT variant construction and its score or noise model (irrespective of ODE SDE)
+        eps = train_eps if not eval else sample_eps
+
+        # TODO: mandate consistency this implementation doesnt address t = 0 instability for alpha ratio VPCP
+        # TODO: cleaner interface for the path constructions so that each path encapsulates its time end points for stability
+        if type(self.path_sampler) in [path.VPCPlan]:
+            # if SDE, t1 = 1 - last_step_size, else t1 = 1 - eps
+            t1 = 1 - eps if (not sde or last_step_size == 0) else 1 - last_step_size
+        elif type(self.path_sampler) in [path.ICPlan, path.GVPCPlan] and (self.model_type != ModelType.VELOCITY or sde):
+            # branch for condOT, GVPPath and SDEs or SCORE and NOISE models
+            # avoid numerical issue by taking a first semi-implicit step
+            # truth is even VPCP is unstable for score parametrization of vector field, this implementation just doesnt address it
+            # and specifically score parametrization of VELOCITY of vectorfield is unstable at t= 0
+            # I dont understand why this implementation doesnt address velocity model to avoid t0=0
+
+            # this line basically skips t0 = 0 for both SDE, ODE score and noise model if its sde or not for GVPCP and ICP
+            # but if its vectorfield/velocity model, it only skips t0 = 0 for "SBDM" and SDE, it wont skip t0 = 0 for velocity ODE
+            # even if the alpha ratio is unstable at t = 0
+            t0 = eps if (diffusion_form == "SBDM" and sde) or self.model_type != ModelType.VELOCITY else 0
+            t1 = 1 - eps if (not sde or last_step_size == 0) else 1 - last_step_size
+        
+        if reverse:
+            t0 = 1 - t0
+            t1 = 1 - t1
+        return t0, t1
     
+    def sample (self, x1):
+
+        
+

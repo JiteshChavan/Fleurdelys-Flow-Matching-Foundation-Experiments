@@ -19,6 +19,7 @@ class sde:
         self.num_timesteps = num_steps
         # TODO: Made a change over here for intuitive interfacing with the class from outside
         # linspace has to be specified num_t_points
+                                        # TODO: MANDATE CONSISTENCY
         self.t = torch.linspace(t0, t1, num_steps+1)
         self.dt = self.t[1] - self.t[0]
         self.drift = drift

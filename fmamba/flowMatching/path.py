@@ -65,10 +65,10 @@ class ICPlan:
         # idk why we are pretending that term of x in the score parametrization is called drift
         # idk why we are pretending that coeff of conditional score is called diffusion
         # idk why the heck we are returning negative of coefficient of x in the score parametrization, in formula its clearly addition
-        drift = alpha_ratio * x
+        x_term = alpha_ratio * x
         score_coefficient = alpha_ratio * (beta_t**2) - beta_t * beta_t_dot
         # why stray away from mathematical convention and negate for reason
-        return drift, score_coefficient
+        return score_coefficient, x_term
     
     # not to be confused with what they call diffusion above lol
     # looks like diffusion coefficient sigma_t
@@ -181,7 +181,7 @@ class ICPlan:
         """
 
         t = expand_t_like_x(t, x)
-        x_term, score_coefficient = self.compute_drift(x, t)
+        score_coefficient, x_term = self.compute_drift(x, t)
         vectorField = score_coefficient * score + x_term
         return vectorField
     
