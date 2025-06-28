@@ -123,6 +123,20 @@ class FlowMatching:
         return t0, t1
     
     def sample (self, x1):
+        """Sampling x0 and t based on the shape of x1 (if needed)
+        Args:
+            x1 : data point z (B, *dim)
+        """
 
+        x0 = torch.randn_like(x1) # eps/x0 ~ pinit
+        t0, t1 = self.check_interval(self.train_eps, self.sample_eps) # for our particular usecase: score model and ode, t0 = eps & t1= 1-eps
+        if self.t_sample_mode == "logitnormal":
+            a, b = -0.5, 1
+            t = b * torch.randn((x1.shape[0],)) + a
+            t = torch.sigmoid(t) * (t1 - t0) + t0
+        else:
+            t = torch.rand((x1.shape[0],)) * (t1 - t0) + t0
+        t = t.to(x1)
+        return t, x0, x1
         
 
