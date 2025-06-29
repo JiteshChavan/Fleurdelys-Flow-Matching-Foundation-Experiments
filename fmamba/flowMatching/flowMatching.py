@@ -144,7 +144,7 @@ class FlowMatching:
     
     def training_losses(self, model, x1, model_kwargs=None):
         """
-        Loss for training the score model
+        Loss for training the vector_field model
         Args:
             - model : backbone model; ut_theta or st_theta
             - x1 (z) : z~pdata
@@ -154,7 +154,7 @@ class FlowMatching:
         if model_kwargs is None:
             model_kwargs = {}
         
-        t, x0, x1 = self.sample(x1) # sample a time point, x0, and data point z
+        t, x0, x1 = self.sample(x1) # sample a time point for each example in batch, x0, and data point z
         # Sample from conditional path xt~pt(.|z), evaluate conditional ut_target(xt|z) which is stable for all t~u[0,1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         # get ut_theta(xt|z), to get minimizer theta* which minimizes marginal loss objective as well since expecation over distributions simulated as monte-carlo is lienar
@@ -170,7 +170,7 @@ class FlowMatching:
         else:
             # returns score_coefficient, x_term in score parametrization of vector_field
             score_coefficient, _ = self.path_sampler.compute_drift(xt,t)
-            beta_t, _ = self.path_sampler.compute_beta_t(path.expand_t_like_x(t, xt)) # (B, *dim)
+            beta_t, _ = self.path_sampler.compute_beta_t(path.expand_t_like_x(t, xt)) # (B, [1]*dim)
             
             # choice of loss weighting that's dependent or independent of time, for score and denoiser models
             if self.loss_type in [WeightType.VELOCITY]:
@@ -181,9 +181,6 @@ class FlowMatching:
                 weight = 1
             else:
                 raise NotImplementedError()
-            """ One way to think about weighting the loss for score and denoiser models is to offset the instability near t = 1
-                just one way, not objective reason behind it, one could also experiment with vector_field loss weighting thats time dependent
-            """
 
             if self.model_type == ModelType.NOISE:
                 terms["loss"] = mean_flat(weight * ((model_output - x0)**2))
@@ -195,6 +192,40 @@ class FlowMatching:
         return terms
     
     def get_drift(self):
+        """member function for obtaining the vector_field function of the probability flow ODE""" # gets you vector field function, to which you pass x, t, model, **model_kwargs
+
+        # score model
+        def score_ode(x, t, model, **model_kwargs):
+            score_coefficient, x_term = self.path_sampler.compute_drift (x, t)
+            model_output = model(x, t, **model_kwargs) # score
+            vector_field = score_coefficient * model_output + x_term # score parametrization of vector field
+            return vector_field
+        
+        def noise_ode(x, t, model, **model_kwargs):
+            score_coefficient, x_term = self.path_sampler.compute_drift(x, t)
+            beta_t, _ = self.path_sampler.compute_beta_t(path.expand_t_like_x(t, x)) # beta_t (B, [1]*dims)
+            model_output = model(x, t, **model_kwargs)
+            score = model_output / -beta_t # model output is -eps
+            return score_coefficient * score + x_term
+        
+        def velocity_ode (x, t, model, **model_kwargs):
+            vector_field = model(x, t, **model_kwargs)
+            return vector_field
+        
+        if self.model_type == ModelType.NOISE:
+            vector_field_fn = noise_ode
+        elif self.model_type == ModelType.SCORE:
+            vector_field_fn = score_ode
+        else:
+            assert self.model_type == ModelType.VELOCITY, f"if model is neither score nor denoiser, it has to be vector_field model"
+            vector_field_fn = velocity_ode
+        
+        def body_fn(x, t, model, **model_kwargs):
+            model_output = vector_field_fn (x, t, model, **model_kwargs)
+            assert model_output.shape == x.shape, f"Output shape from the vector_field must match input shape"
+            return model_output
+        
+        return body_fn
 
     
 
