@@ -51,6 +51,9 @@ def create_flow(
         train_eps = 1e-3 if train_eps is None else train_eps
         sample_eps = 1e-3 if sample_eps is None else sample_eps
     else: # velocity & [GVP, LINEAR] is stable everywhere
+        # instability usually occurs when using alpha_ratio for score parametrization of vectorfield
+        # we directly regress against conditional ut_theta(xt | z)
+        # so its all stable and good
         train_eps = 0
         sample_eps = 0
     

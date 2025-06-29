@@ -37,7 +37,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision.utils import save_image
 
 # Flow matching
-from flow import Sampler, create_flow
+from flowMatching import Sampler, create_flow # create_flow is defined in __init__.py for flowMatching
 
 # for easy imports from eval toolbox
 eval_import_path = (Path(__file__).parent.parent / "eval_toolbox").resolve().as_posix()

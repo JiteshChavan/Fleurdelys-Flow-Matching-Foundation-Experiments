@@ -99,6 +99,9 @@ class FlowMatching:
         # however we do make changes if its linear CondOT variant construction and its score or noise model (irrespective of ODE SDE)
         eps = train_eps if not eval else sample_eps
 
+        """IMPORTANT: Vector_Field is stable everywhere, when we dont use score parametrization, so the following branches are not 
+        that important for our usecase"""
+
         # TODO: mandate consistency this implementation doesnt address t = 0 instability for alpha ratio VPCP
         # TODO: cleaner interface for the path constructions so that each path encapsulates its time end points for stability
         if type(self.path_sampler) in [path.VPCPlan]:
@@ -129,14 +132,41 @@ class FlowMatching:
         """
 
         x0 = torch.randn_like(x1) # eps/x0 ~ pinit
-        t0, t1 = self.check_interval(self.train_eps, self.sample_eps) # for our particular usecase: score model and ode, t0 = eps & t1= 1-eps
+        t0, t1 = self.check_interval(self.train_eps, self.sample_eps) # for our particular usecase: vector_field model, ode, and GVP, t0 = 0 & t1= 1
         if self.t_sample_mode == "logitnormal":
             a, b = -0.5, 1
             t = b * torch.randn((x1.shape[0],)) + a
             t = torch.sigmoid(t) * (t1 - t0) + t0
         else:
-            t = torch.rand((x1.shape[0],)) * (t1 - t0) + t0
+            t = torch.rand((x1.shape[0],)) * (t1 - t0) + t0 # sample from u[t0,t1) exclusive terminal (for our usecase u[0, 1) )
         t = t.to(x1)
         return t, x0, x1
+    
+    def training_losses(self, model, x1, model_kwargs=None):
+        """
+        Loss for training the score model
+        Args:
+            - model : backbone model; ut_theta or st_theta
+            - x1 (z) : z~pdata
+            - model_kwargs: additional arguments for the model, y for guidance
+        """
+
+        if model_kwargs is None:
+            model_kwargs = {}
+        
+        t, x0, x1 = self.sample(x1) # sample a time point, x0, and data point z
+        t, xt, ut = self.path_sampler.plan(t, x0, x1)
+        model_output = model(xt, t, **model_kwargs)
+        B, *_, C = xt.shape # extract channels and batch size from the conditional prob path.
+
+        assert model_output.size() == (B, *xt.size()[1:-1], C), f"Model Output shape mismatch with the reference point along the conditional prob path"
+
+        terms = {}
+        terms["pred"] = model_output
+        if self.model_type == ModelType.VELOCITY:
+            terms["loss"] = mean_flat( ((model_output - ut)**2) )
+        else:
+
+        
         
 
