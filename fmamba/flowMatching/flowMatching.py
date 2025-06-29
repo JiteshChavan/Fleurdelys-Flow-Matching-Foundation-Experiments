@@ -155,7 +155,9 @@ class FlowMatching:
             model_kwargs = {}
         
         t, x0, x1 = self.sample(x1) # sample a time point, x0, and data point z
+        # Sample from conditional path xt~pt(.|z), evaluate conditional ut_target(xt|z) which is stable for all t~u[0,1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
+        # get ut_theta(xt|z), to get minimizer theta* which minimizes marginal loss objective as well since expecation over distributions simulated as monte-carlo is lienar
         model_output = model(xt, t, **model_kwargs)
         B, *_, C = xt.shape # extract channels and batch size from the conditional prob path.
 
@@ -163,9 +165,38 @@ class FlowMatching:
 
         terms = {}
         terms["pred"] = model_output
-        if self.model_type == ModelType.VELOCITY:
-            terms["loss"] = mean_flat( ((model_output - ut)**2) )
+        if self.model_type == ModelType.VELOCITY: # our experiments just train a vector_field (velocity), losses for all time steps are treated equally no time dependent weighting
+            terms["loss"] = mean_flat( ((model_output - ut)**2) ) # conditional flow matching loss
         else:
+            # returns score_coefficient, x_term in score parametrization of vector_field
+            score_coefficient, _ = self.path_sampler.compute_drift(xt,t)
+            beta_t, _ = self.path_sampler.compute_beta_t(path.expand_t_like_x(t, xt)) # (B, *dim)
+            
+            # choice of loss weighting that's dependent or independent of time, for score and denoiser models
+            if self.loss_type in [WeightType.VELOCITY]:
+                weight = (score_coefficient / beta_t) ** 2
+            elif self.loss_type in [WeightType.LIKELIHOOD]:
+                weight = score_coefficient / (beta_t ** 2)
+            elif self.loss_type in [WeightType.NONE]:
+                weight = 1
+            else:
+                raise NotImplementedError()
+            """ One way to think about weighting the loss for score and denoiser models is to offset the instability near t = 1
+                just one way, not objective reason behind it, one could also experiment with vector_field loss weighting thats time dependent
+            """
+
+            if self.model_type == ModelType.NOISE:
+                terms["loss"] = mean_flat(weight * ((model_output - x0)**2))
+            else: # score model
+                # conditional score matching objective is  -eps/beta_t = -x0/beta_t so model_out * beta_t = -x0
+                # we multiply by beta_t to avoid division by 0 and thus instability near t=1
+                terms["loss"] = mean_flat(weight * ((beta_t * model_output + x0) ** 2))
+            
+        return terms
+    
+    def get_drift(self):
+
+    
 
         
         

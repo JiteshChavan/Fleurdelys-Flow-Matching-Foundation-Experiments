@@ -1,5 +1,5 @@
-from .flow import ModelType, PathType, Flow, WeightType
-from .flow import Sampler
+from .flowMatching import ModelType, PathType, Flow, WeightType
+from .flowMatching import Sampler
 
 def create_flow(
         path_type="Linear",
