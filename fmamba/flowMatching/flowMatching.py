@@ -192,7 +192,7 @@ class FlowMatching:
         return terms
     
     def get_drift(self):
-        """member function for obtaining the vector_field function of the probability flow ODE""" # gets you vector field function, to which you pass x, t, model, **model_kwargs
+        """Returns a function that computes the vector field ut_theta(xt) along the conditional path pt(x|z)""" # gets you vector field function, to which you pass x, t, model, **model_kwargs
 
         # score model
         def score_ode(x, t, model, **model_kwargs):
@@ -204,8 +204,8 @@ class FlowMatching:
         def noise_ode(x, t, model, **model_kwargs):
             score_coefficient, x_term = self.path_sampler.compute_drift(x, t)
             beta_t, _ = self.path_sampler.compute_beta_t(path.expand_t_like_x(t, x)) # beta_t (B, [1]*dims)
-            model_output = model(x, t, **model_kwargs)
-            score = model_output / -beta_t # model output is -eps
+            model_output = model(x, t, **model_kwargs) # noise eps
+            score = model_output / -beta_t # model output is eps
             return score_coefficient * score + x_term
         
         def velocity_ode (x, t, model, **model_kwargs):
@@ -228,7 +228,37 @@ class FlowMatching:
         return body_fn
 
     
+    def get_score(self):
+        """ Returns a function that computes the score ∇ₓ log p_t(x|z) for the given model type.
+            Handles model types: NOISE, SCORE, VELOCITY.
+        """
+        
+        def score_from_noise_model(x, t, model, **model_kwargs):
+            noise = model(x, t, **model_kwargs)
+            beta_t, _ = self.path_sampler.compute_beta_t(path.expand_t_like_x(t, x))
+            score = - noise / beta_t
+            return score
 
+        def score_from_score_model(x, t, model, **model_kwargs):
+            score = model (x, t, **model_kwargs)
+            return score
+        
+        def score_from_vector_field (x, t, model, **model_kwargs):
+            vector_field = model(x, t, **model_kwargs)
+            score = self.path_sampler.get_score_from_vector_field(vector_field, x, t)
+            return score
+
+
+        if self.model_type == ModelType.NOISE:
+            score_fn = score_from_noise_model
+        elif self.model_type == ModelType.SCORE:
+            score_fn = score_from_score_model
+        elif self.model_type == ModelType.VELOCITY:
+            score_fn = score_from_vector_field
+        else:
+            raise NotImplementedError()
+        
+        return score_fn
         
         
 
