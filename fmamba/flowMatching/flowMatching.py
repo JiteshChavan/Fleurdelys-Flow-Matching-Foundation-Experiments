@@ -191,7 +191,7 @@ class FlowMatching:
             
         return terms
     
-    def get_drift(self):
+    def get_vector_field(self):
         """Returns a function that computes the vector field ut_theta(xt) along the conditional path pt(x|z)""" # gets you vector field function, to which you pass x, t, model, **model_kwargs
 
         # score model
@@ -259,6 +259,71 @@ class FlowMatching:
             raise NotImplementedError()
         
         return score_fn
+    
         
         
+class Sampler:
+    """Sampler class for the flowMatching model"""
+    
+    def __init__(
+            self,
+            flowMatching,
+        ):
+        """Constructor for a general sampler; supporting different sampling methods
+        Args:
+        - flow: a flowMatching object specify model prdiction type & conditonal path construction (linear, VPCP, GVPCP)
+        """
 
+        self.flowMatching = flowMatching
+        self.vector_field = flowMatching.get_vector_field()
+        self.score = flowMatching.get_score()
+
+    def __get_sde_drift_and_diffusion_coefficient(
+            self,
+            *,
+            diffusion_form="SBDM",
+            diffusion_norm=1.0,
+    ):
+        def diffusion_coefficient_fn (x, t):
+            diffusion_coefficient = self.flowMatching.path_sampler.compute_diffusion(x, t, form=diffusion_form, norm=diffusion_norm) # default diffusion form is None, no diffusion
+            return diffusion_coefficient
+        
+        # drift = vectorfield (x, t, model, model_kwargs) + diffusion_coefficient * score
+        sde_drift = lambda x, t, model, **model_kwargs: self.vector_field(x, t, model, **model_kwargs) + diffusion_coefficient_fn(x, t) * self.score(
+            x, t, model, **model_kwargs
+        )
+
+
+
+        sde_diffusion_coefficient_fn = diffusion_coefficient_fn
+
+        return sde_drift, sde_diffusion_coefficient_fn
+    
+    def __get_last_step(
+            self,
+            sde_drift,
+            *,
+            last_step,
+            last_step_size,
+    ):
+        """Get the last step function of the SDE solver"""
+        if last_step is None:
+            last_step_fn = lambda x, t, model, **model_kwargs: x
+        elif last_step == "Mean":
+            last_step_fn = (
+                lambda x, t, model, **model_kwargs: x + sde_drift(x, t, model, **model_kwargs) * last_step_size
+            )
+        elif last_step == "Tweedie":
+            alpha = self.flowMatching.path_sampler.compute_alpha_t # simple aliasing; the original name is too long
+            beta = self.flowMatching.path_sampler.compute_beta_t
+            last_step_fn = lambda x, t, model, **model_kwargs: x/ alpha(t)[0][0] + (beta(t)[0][0] ** 2) / alpha(t)[0][t] * self.score(x, t, model, **model_kwargs)
+        elif last_step == "Euler":
+            last_step_fn = lambda x, t, model, **model_kwargs: x + self.vector_field(x, t, model, **model_kwargs) * last_step_size
+        else:
+            raise NotImplementedError()
+        
+        return last_step_fn
+    
+    def sample_sde(
+            
+    )
