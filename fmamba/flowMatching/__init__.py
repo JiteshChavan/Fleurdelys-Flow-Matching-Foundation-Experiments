@@ -1,4 +1,4 @@
-from .flowMatching import ModelType, PathType, Flow, WeightType
+from .flowMatching import ModelType, PathType, FlowMatching, WeightType
 from .flowMatching import Sampler
 
 def create_flow(
@@ -58,7 +58,7 @@ def create_flow(
         sample_eps = 0
     
     # create flow state
-    state = Flow (
+    state = FlowMatching (
         model_type=model_type,
         path_type=path_type,
         loss_type=loss_type,

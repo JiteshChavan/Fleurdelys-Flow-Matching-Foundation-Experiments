@@ -86,7 +86,7 @@ class ode:
 
     def __init__(
             self,
-            drift,
+            ut_theta,
             *,
             t0,
             t1,
@@ -97,7 +97,7 @@ class ode:
     ):
         assert t0 < t1, "Flow convention is t0 (for pinit) < t1 (for pdata)"
 
-        self.drift = drift
+        self.ut_theta = ut_theta
         # TODO: Again same rectification for intuitive interface
         # linspace has to be specified tpoints, not num_steps
         self.t = torch.linspace(t0, t1, num_steps+1)
@@ -110,7 +110,7 @@ class ode:
 
         def _fn (t, x):
             t = torch.ones(x[0].size(0)).to(device) * t if isinstance(x, tuple) else torch.ones(x.size(0)).to(device) * t
-            model_output = self.drift(x, t, model, **model_args)
+            model_output = self.ut_theta(x, t, model, **model_args)
             return model_output
 
         t = self.t.to(device)

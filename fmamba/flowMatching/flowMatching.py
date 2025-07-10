@@ -102,7 +102,6 @@ class FlowMatching:
         """IMPORTANT: Vector_Field is stable everywhere, when we dont use score parametrization, so the following branches are not 
         that important for our usecase"""
 
-        # TODO: mandate consistency this implementation doesnt address t = 0 instability for alpha ratio VPCP
         # TODO: cleaner interface for the path constructions so that each path encapsulates its time end points for stability
         if type(self.path_sampler) in [path.VPCPlan]:
             # if SDE, t1 = 1 - last_step_size, else t1 = 1 - eps
@@ -271,14 +270,14 @@ class Sampler:
         ):
         """Constructor for a general sampler; supporting different sampling methods
         Args:
-        - flow: a flowMatching object specify model prdiction type & conditonal path construction (linear, VPCP, GVPCP)
+        - flowMatching: a flowMatching object specify model prdiction type & conditonal path construction (linear, VPCP, GVPCP)
         """
 
         self.flowMatching = flowMatching
         self.vector_field = flowMatching.get_vector_field()
         self.score = flowMatching.get_score()
 
-    def __get_sde_drift_and_diffusion_coefficient(
+    def __get_sde_drift_and_diffusion_coefficient_fn(
             self,
             *,
             diffusion_form="SBDM",
@@ -289,7 +288,7 @@ class Sampler:
             return diffusion_coefficient
         
         # drift = vectorfield (x, t, model, model_kwargs) + diffusion_coefficient * score
-        sde_drift = lambda x, t, model, **model_kwargs: self.vector_field(x, t, model, **model_kwargs) + diffusion_coefficient_fn(x, t) * self.score(
+        sde_drift_fn = lambda x, t, model, **model_kwargs: self.vector_field(x, t, model, **model_kwargs) + diffusion_coefficient_fn(x, t) * self.score(
             x, t, model, **model_kwargs
         )
 
@@ -297,7 +296,7 @@ class Sampler:
 
         sde_diffusion_coefficient_fn = diffusion_coefficient_fn
 
-        return sde_drift, sde_diffusion_coefficient_fn
+        return sde_drift_fn, sde_diffusion_coefficient_fn
     
     def __get_last_step(
             self,
@@ -308,7 +307,7 @@ class Sampler:
     ):
         """Get the last step function of the SDE solver"""
         if last_step is None:
-            last_step_fn = lambda x, t, model, **model_kwargs: x
+            last_step_fn = lambda x, t, model, **model_kwargs: x # identity transformation I * X
         elif last_step == "Mean":
             last_step_fn = (
                 lambda x, t, model, **model_kwargs: x + sde_drift(x, t, model, **model_kwargs) * last_step_size
@@ -316,7 +315,8 @@ class Sampler:
         elif last_step == "Tweedie":
             alpha = self.flowMatching.path_sampler.compute_alpha_t # simple aliasing; the original name is too long
             beta = self.flowMatching.path_sampler.compute_beta_t
-            last_step_fn = lambda x, t, model, **model_kwargs: x/ alpha(t)[0][0] + (beta(t)[0][0] ** 2) / alpha(t)[0][t] * self.score(x, t, model, **model_kwargs)
+            # destorys batch structure, either way we arent using this function for last step
+            last_step_fn = lambda x, t, model, **model_kwargs: x / alpha(t)[0][0] + (beta(t)[0][0] ** 2) / alpha(t)[0][0] * self.score(x, t, model, **model_kwargs)
         elif last_step == "Euler":
             last_step_fn = lambda x, t, model, **model_kwargs: x + self.vector_field(x, t, model, **model_kwargs) * last_step_size
         else:
@@ -325,5 +325,165 @@ class Sampler:
         return last_step_fn
     
     def sample_sde(
+            self,
+            *,
+            sampling_method="Euler",
+            diffusion_form="SBDM",
+            diffusion_norm=1.0,
+            last_step="Mean",
+            last_step_size=0.004,
+            num_steps=250,
+    ):
+        """returns a sampling fucntion with given SDE settings
+        Args:
+        - sampling_method: type of sampler used in solving the SDE; default to be Euler-Maruyama
+        - diffusion_form: function form of diffusion coefficient; default to be matching SBDM
+        - diffusion_norm: function magnitude of diffusion coefficient; default to 1
+        - last_step: type of the last step; step along drift ("mean")
+        - last_step_size: size of the last step; default to match the stride of 250 steps over [0, 1]
+        - num_steps: total integration steps of SDE
+        """
+
+        num_steps = num_steps if sampling_method == "Euler" else num_steps // 2
+        if last_step is None:
+            last_step_size = 0.0
+        else:
+            if last_step_size == -1:
+                last_step_size = 1.0 / num_steps
+        
+        sde_drift, sde_diffusion_coefficient = self.__get_sde_drift_and_diffusion_coefficient_fn(diffusion_form=diffusion_form, diffusion_norm=diffusion_norm)
+
+        t0, t1 = self.flowMatching.check_interval(
+            self.flowMatching.train_eps,
+            self.flowMatching.sample_eps,
+            diffusion_form=diffusion_form,
+            sde=True,
+            eval=True,
+            reverse=False,
+            last_step_size=last_step_size,
+        )
+
+        # num_steps [0, 1] last step is evaluated at t=1, gnarly, goes against principles
+        _sde = sde (sde_drift, sde_diffusion_coefficient, t0=t0, t1=t1, num_steps=num_steps, sampler_type=sampling_method)
+
+        last_step_fn = self.__get_last_step(sde_drift, last_step=last_step, last_step_size=last_step_size)
+
+        def _sample(x0, model, **model_kwargs):
+            xs = _sde.sample(x0, model, **model_kwargs)
+            t1s = torch.ones(x0.size(0), device=x0.device) * t1
+            x = last_step_fn(xs[-1], t1s, model, **model_kwargs)
+            xs.append(x)
             
-    )
+            # num_steps within 0 till 1 and final at t=1
+            assert len(xs) == num_steps + 1, "Number of samples along trajectory does not match the number of steps"
+            return xs
+        
+        return _sample
+    
+    def sample_ode(
+            self,
+            *,
+            sampling_method="dopri5",
+            num_steps=50, #50 steps [0,1) + framework to evaluate last step at t=1, last_step size 0 would make it adhere to convention that we evaluate [0,1) and avoid VF eval at t=1
+            atol=1e-6,
+            rtol=1e-3,
+            reverse=False,
+    ):
+        """returns a sampling function with given ODE settings
+        Args:
+        - sampling_method: type of sampler used in solving the ODE;
+         default to be Dopri5
+        - num_steps:
+            - fixed solver (Euler, Heun): the actual number of integration steps performed
+            - adaptive solver (Dopri5): the number of datapoint saved during integration; produced by interpolation
+        - atol: absolute error tolerance of the solver
+        - rtol: relative error tolerance of the solver
+        - reverse: inverted time convention or not; default false
+        """
+        if reverse:
+            ut_theta = lambda x, t, model, **model_kwargs: self.vector_field(x, torch.ones_like(t)*(1-t), model, **model_kwargs)
+
+        else:
+            ut_theta = self.vector_field
+        
+
+        t0, t1 = self.flowMatching.check_interval(
+            self.flowMatching.train_eps,
+            self.flowMatching.sample_eps,
+            sde=False,
+            eval=True,
+            reverse=reverse,
+            last_step_size=0.0,
+        )
+
+        _ode = ode (
+            drift=ut_theta,
+            t0=t0,
+            t1=t1,
+            sampler_type=sampling_method,
+            num_steps=num_steps,
+            atol=atol,
+            rtol=rtol,
+        )
+
+        return _ode.sample
+    
+    def sample_ode_likelihood(
+            self,
+            *,
+            sampling_method="dopri15",
+            num_steps=50,
+            atol=1e-6,
+            rtol=1e-3,
+    ):
+        """returns a sampling function for calculating likelihood with given ODE settings
+        Args:
+        - sampling_method: type of sampler used in solving the ODE; default : Dopri5
+        - num_steps:
+            - fixed solver (Euler, Heun): the actual number of integration steps performed
+            - adaptive solver (Dopri5): the number of datapoints saved during integration; produced by interpolation
+        - atol: absolute error tolerance for the solver
+        - rtol: relative error tolerance for the solver
+        """
+
+        def _likelihood_drift (x, t, model, **model_kwargs):
+            x, _ = x
+            eps = torch.randint(2, x.size(), dtype=torch.float, )
+            t = torch.ones_like(t) * (1-t)
+            with torch.enable_grad():
+                x.requires_grad = True
+                grad = torch.autograd.grad(torch.sum(self.vector_field(x, t, model, **model_kwargs) * eps), x)[0]
+                logp_grad = torch.sum(grad * eps, dim=tuple(range(1, len(x.size()))))
+                vector_field = self.vector_field(x, t, model, **model_kwargs)
+            return (-vector_field, logp_grad)
+            
+
+        t0, t1 = self.flowMatching.check_interval(
+            self.flowMatching.train_eps,
+            self.flowMatching.sample_eps,
+            sde=False,
+            eval=True,
+            reverse=False,
+            last_step_size=0.0,
+        )
+
+        _ode = ode(
+            ut_theta=_likelihood_drift,
+            t0=t0,
+            t1=t1,
+            sampler_type=sampling_method,
+            num_steps=num_steps,
+            atol=atol,
+            rtol=rtol,
+        )
+
+        def _sample_fn(x, model, **model_kwargs):
+            init_logp = torch.zeros(x.size(0)).to(x)
+            input = (x, init_logp)
+            drift, delta_logp = _ode.sample(input, model, **model_kwargs)
+            drift, delta_logp = drift[-1], delta_logp[-1]
+            prior_logp = self.flowMatching.prior_logp(drift)
+            logp = prior_logp - delta_logp
+            return logp, drift
+        
+        return _sample_fn
