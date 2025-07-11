@@ -52,4 +52,32 @@ class CrossAttentionFusion(nn.Module):
 
         return y
     
-    def forward(self)
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor)->torch.Tensor:
+        # here C = n_embd / 2
+        B, T, C = x1.shape
+
+        qkv1 = self.qkv1(x1).reshape(B, T, 3, self.n_head, self.head_size).permute(2, 0, 3, 1, 4) # (3, B, nh, T, hs)
+        q1, k1, v1 = qkv1.unbind(0) # 3x (B, nh, T, hs)
+        q1 = self.norm_q1(q1)
+        k1 = self.norm_k1(k1)
+
+        qkv2 = self.qkv2(x2).reshape(B, T, 3, self.n_head, self.head_size).permute(2, 0, 3, 1, 4) # (3, B, nh, T, hs)
+        q2, k2, v2 = qkv2.unbin(0) # 3x (B, nh, T, hs)
+        q2 = self.norm_q2(q2)
+        k2 = self.norm_k2(k2)
+
+        # all are (B, nh, T, hs)
+        if not self.swap_k:
+            x12 = self._compute_attention(q1, k2, v2)
+            x21 = self._compute_attention(q2, k1, v1)
+        else:
+            x12 = self._compute_attention(q2, k1, v2)
+            x21 = self._compute_attention(q1, k2, v1)
+
+        x12 = x12.transpose(1, 2).reshape(B, T, C)
+        x21 = x21.transpose(1, 2).reshape(B, T, C)
+
+        x = self.proj( torch.cat((x12, x21), dim=-1) )
+        x = self.proj_drop(x)
+
+        return x
