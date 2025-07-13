@@ -158,18 +158,35 @@ class MetricLogger(object):
         print("{} Total time: {} ({:.4f} s / it)".format(header, total_time_str, total_time / len(iterable)))
 
 
+def _load_checkpoint_for_ema(model_ema, checkpoint):
+    """
+    Workaround for ModelEma._load_checkpoint to accept an already-loaded object
+    """
+    mem_file = io.BytesIO()
+    torch.save({"state_dict_ema": checkpoint}, mem_file)
+    mem_file.seek(0)
+    model_ema._load_checkpoint(mem_file)
 
 
-    
-        
+def setup_for_distributed(is_master):
+    """
+    This function disables printing when not in master process
+    """
+    import builtins as __builtin__
+
+    builtin_print = __builtin__.print
+
+    def print(*args, **kwargs):
+        force = kwargs.pop("force", False)
+        if is_master or force:
+            builtin_print(*args, **kwargs)
+
+    __builtin__.print = print
 
 
-    
 def is_dist_avail_and_initialized():
     if not dist.is_available():
         return False
-    
     if not dist.is_initialized():
         return False
-    
     return True
