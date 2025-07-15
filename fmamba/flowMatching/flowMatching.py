@@ -416,6 +416,9 @@ class Sampler:
             last_step_size=0.0,
         )
 
+        # fun fact ode class doesnt care about sampling method
+        # despite sending the argument, the odeint solver is never seeded with the method
+        # and by default uses dopri15 (5th order Runge-Kutta method)
         _ode = ode (
             drift=ut_theta,
             t0=t0,
