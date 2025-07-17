@@ -114,13 +114,13 @@ def main(mode, args):
     if mode == "ODE":
         folder_name = (
             f"{model_string_name}-{ckpt_string_name}-"
-            f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"
+            f"cfg-{args.cfg_scale}-{args.local_batch_size}-"
             f"{mode}-{args.num_sampling_steps}-{args.sampling_method}"
         )
     elif mode == "SDE":
         folder_name = (
             f"{model_string_name}-{ckpt_string_name}-"
-            f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"
+            f"cfg-{args.cfg_scale}-{args.local_batch_size}-"
             f"{mode}-{args.num_sampling_steps}-{args.sampling_method}-"
             f"{args.diffusion_form}-{args.last_step}-{args.last_step_size}"
         )
@@ -134,7 +134,6 @@ def main(mode, args):
     dist.barrier()
 
     # How many samples we need to generate on each GPU and how many iterations we need to run:
-    # TODO: make sure it reads args.local_batch_size everywhere
     B = args.local_batch_size
     global_batch_size = B * dist.get_world_size()
     total_samples = int (math.ceil(args.num_fid_samples / global_batch_size) * global_batch_size)
@@ -248,8 +247,68 @@ def none_or_str(value):
 
 
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
 
+    if len(sys.argv) < 2:
+        print("Usage: program.py <mode> [options]")
+        sys.exit(1)
+    
+    mode = sys.argv[1]
 
+    assert mode[:2] != "--", f"Usage: program.py <mode> [options]"
+    assert mode in ["ODE", "SDE"], f"Invalid mode. Please choose 'ODE' or 'SDE'"
+
+    parser.add_argument("--model", type=str, default="Fleurdelys-XL/2")
+    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
+    parser.add_argument("--inference-dir", type=str, default="Inferences")
+    parser.add_argument("--local-batch-size", type=int, default=4)
+    parser.add_argument("--num-fid-samples", type=int, default=50_000)
+    parser.add_argument("--image-size", type=int, choices=[256, 512, 1024], default=256)
+    parser.add_argument("--num-classes", type=int, default=1)
+    parser.add_argument("--cfg-scale", type=float, default=1.0)
+    parser.add_argument("--num-sampling-steps", type=int, default=250)
+    parser.add_argument("--global-seed", type=int, default=1337)
+    parser.add_argument(
+        "--tf32",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="By default, use TF32 matmuls. Faster passes on Ampere GPUs"
+    )
+    parser.add_argument("--learn-sigma", action="store_true")
+    parser.add_argument("--num-in-channels", type=int, default=4) # VAE latent space channels
+    parser.add_argument("--label-dropout", type=float, default=-1)
+    parser.add_argument("--use-final-norm", action="store_true")
+    parser.add_argument(
+        "--use-attn-every-k-layers",
+        type=int,
+        default=-1,
+    )
+    parser.add_argument("--not-use-gated-mlp", action="store_true")
+    parser.add_argument("--use-even-classes", action="store_true")
+    parser.add_argument("--image-ext", type=str, default="jpg")
+    parser.add_argument("--ada-cfg", action="store_true", help="flag for adaptive cfg")
+
+    parser.add_argument(
+        "--bimamba-type", type=str, default="v2", choices=["v2", "none", "zigma_8", "sweep_8", "jpeg_8", "sweep_4"]
+    )
+    parser.add_argument("--pe-type", type=str, default="ape", choices=["ape", "cpe", "rope"])
+    parser.add_argument(
+        "--block-type",
+        type=str,
+        default="linear",
+        choices=["linear", "raw", "wave", "combined", "window", "combined_fourier", "combined_einfft"],
+    )
+    parser.add_argument("--cond-mamba", action="store_true")
+    parser.add_argument("--scanning-continuity", action="store_true")
+    parser.add_argument("--enable-fourier-layers", action="store_true")
+    parser.add_argument("--rms-norm", action="store_true")
+    parser.add_argument("--fused-add-norm", action="store_true")
+    parser.add_argument("--drop-path", type=float, default=0.0)
+    parser.add_argument("--learnable-pe", action="store_true")
+
+    parser.add_argument("--eval-refdir", type=str, default=None)
+    
 
 
     
