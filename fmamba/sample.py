@@ -185,6 +185,7 @@ def main(mode, args):
     print(f"Sampling took {time() - start_time} seconds.")
 
     # Save and disaplay images:
+    os.makedirs(args.inference_path, exist_ok=True)
     if use_cfg:
         torchvision.utils.save_image(samples, f"sample_cfg{args.cfg_scale}.png", nrow=8, normalize=True, value_range=(-1,1), pad_value=1.)
     else:
@@ -206,6 +207,7 @@ if __name__ == "__main__":
     assert mode[:2] != "--", "Usage: program.py <mode> [options]"
     assert mode in ["ODE", "SDE"], "Invalid mode. Please choose 'ODE' or 'SDE'"
 
+    parser.add_argument("--inference-path", type=str, default=".")
     # irrelevant for our construction
     # parser.add_argument ("--sampler-type", type=str, default="ODE", choices=["ODE", "SDE"])
 
