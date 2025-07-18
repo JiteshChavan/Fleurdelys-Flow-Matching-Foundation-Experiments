@@ -308,7 +308,64 @@ if __name__ == "__main__":
     parser.add_argument("--learnable-pe", action="store_true")
 
     parser.add_argument("--eval-refdir", type=str, default=None)
-    
+    parser.add_argument(
+        "--eval-metric",
+        type=str,
+        default="fid50k_full",
+        help="Metrics to compute, separated by comma (e.g. fid50k_full, pr50k3_full)"
+    )
 
+    # groups for better aesthetics for help
+    group = parser.add_argument_group("MoE arguments")
+    group.add_argument("--num-moe-experts", type=int, default=8)
+    group.add_argument("--mamba-moe-layers", type=none_or_str, nargs="*", default=None) # multiple string arguments for this flag, stored as string or none
+    group.add_argument("--is-moe", action="store_true")
+    # TODO: integrate support for ecmoe in single GPU sampling script and training script
+    group.add_argument(
+        "--routing-mode", type=str, choices=["sinkhorn", "top1", "top2", "sinkhorn_top2", "ecmoe"], default="top1"
+    )
+    group.add_argument("--gated-linear-unit", action="store_true")
+
+    group = parser.add_argument_group("Flow Matching arguments")
+    group.add_argument("--path-type", type=str, default="Linear", choices=["Linear", "GVP", "VP"])
+    group.add_argument("--prediction", type=str, default="velocity", choices=["velocity", "score", "noise"])
+    group.add_argument("--loss-weight", type=none_or_str, default=None, choices=[None, "velocity", "likelihood"])
+    group.add_argument("--sample-eps", type=float)
+    group.add_argument("--train-eps", type=float)
+
+    if mode == "ODE":
+        group = parser.add_argument_group("ODE Arguments")
+        group.add_argument(
+            "--sampling-method",
+            type=str,
+            default="dopri5",
+            help="blackbox ODE solver methods; full list check https://github.com/rtqichen/torchdiffeq",
+        )
+        group.add_argument("--atol", type=float, default=1e-6, help="absolute tolerance")
+        group.add_argument("--rtol", type=float, default=1e-3, help="relative tolenrance")
+        group.add_argument("--reverse", action="store_true")
+        group.add_argument("--likelihood", action="store_true")
+    elif mode == "SDE":
+        group = parser.add_argument_group("SDE arguments")
+        group.add_argument("--sampling-method", type=str, default="Euler", choices=["Euler", "Heun"])
+        group.add_argument(
+            "--diffusion-form",
+            type=str,
+            default="none",
+            choices=["none", "constant", "SBDM", "sigma", "linear", "decreasing", "increasing-decreasing", "log"],
+            help="form of diffusion coefficient in the SDE",
+        )
+        group.add_argument("--diffusion-norm", type=float, default=1.0)
+        group.add_argument(
+            "--last-step",
+            type=none_or_str,
+            default="Mean",
+            choices=[None, "Mean", "Tweedie", "Euler"],
+            help="Form of the last step in  simulation",
+        )
+        group.add_argument("--last-step-size", type=float, default=-1, help="size of the last step in SDE simulation")
+    
+    args = parser.parse_args()
+    main(mode, args)
 
     
