@@ -36,6 +36,7 @@ def modulate(x, shift, scale):
 #################################################################################
 #                   Sine/Cosine Positional Embedding Functions                  #
 #################################################################################
+# inspiredfrom
 # https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
@@ -97,5 +98,37 @@ def get_1d_sincos_pos_embed_from_grid(pos_grid, embed_dim):
 
     emb = np.concatenate([sin_embd, cos_embd], axis=1) # (T, D)
     return emb
+
+# --------------------------------------------------------------------------------
+# Interpolate position embeddings for high-resolution
+# Regerences:
+# DeiT: https://github.com/facebookresearch/deit
+# --------------------------------------------------------------------------------
+def interpolate_pos_embed(model, checkpoint_model):
+    if "pos_embed" in checkpoint_model:
+        pos_embed_checkpoint = checkpoint_model["pos_embed"]
+        embedding_size = pos_embed_checkpoint.shape[-1] # channels
+        num_patches = model.x_embedder.num_patches # patches in new resolution
+        num_extra_tokens = (model.pos_embed.shape[-2] - num_patches) # same number of extra tokens, only resolution is different
+        # original height (== width) from the checkpoint
+        orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens)**0.5)
+        # new height (== width) for the new resolution
+        new_size = int(num_patches**0.5) # num patches are derived from the model.x_embedder so that T corresponds to the new resolutions, also it doesnt coutn extra tokens
+        # class_token and dist_token are kept unchanged
+        if orig_size != new_size:
+            print("Interpolating positional embedding from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+            extra_tokens = pos_embed_checkpoint[:,:num_extra_tokens] # pos_embed is usually (1, T, C) for ease of broadcasting x = x + pos_embed
+            # only the position tokens are interpolated
+            pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+            pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2) # (B, C, H, W)
+            pos_tokens = F.interpolate(
+                pos_tokens, size=(new_size, new_size), mode="bicubic", align_corners=False
+            ) # (B, C, H, W)
+            pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2) #(B, T, C)
+            new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1) # concatenate extra tokens along T not along B hence dim = 1
+            checkpoint_model["pos_embed"] = new_pos_embed
+
+
+
 
 
