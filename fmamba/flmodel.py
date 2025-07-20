@@ -237,3 +237,95 @@ class FinalLayer (nn.Module):
         x = modulate(self.norm_final(x), shift, scale) # x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1) -> (B, T, C)
         x = self.linear(x) # (B, T, C) - > (B, T, patch_size * patch_size * out_channels)
         return x
+    
+class FlBlock(nn.Module):
+    def __init__(
+            self,
+            dim,
+            mixer_cls,
+            norm_cls=nn.LayerNorm,
+            fused_add_norm=False,
+            residual_in_fp32 = False,
+            drop_path=0.0,
+            reverse=False,
+            transpose=False,
+            scanning_continuity=False,
+            skip=False,
+            use_gated_mlp=True,
+    ):
+        """
+        Simple block wrapping a mixer class (attention/mamba) with LayerNorm/RMSNorm and residual connection.
+
+        This block has different structure compared to a regular pre layer norm transformer block.
+        The standard is layer norm -> MHA/MLP -> proj (add)
+        [Ref: https://arxiv.org/abs/2002.04745]
+
+        Here we have a residual input (x) from previous block, aggregated x (processed by mixer attention/mamba).
+        First this block adds residual with aggregated signal (x + proj(att(x))) which becomes residual for this block -> LN -> Mixer (out)
+        then this block returns both out and the new residual
+        returns out, previous residual(x + proj(att(x)))
+
+        basically returns both output of the mixer projection and the residual.
+        This is purely for performance reasons, as we can fuse add and layer norm.
+        The residual needs to be provided (except for the very first block)
+        """
+
+        super().__init__()
+        self.residual_in_fp32 = residual_in_fp32
+        self.fused_add_norm = fused_add_norm
+        self.reverse = reverse
+        self.transpose = transpose
+        self.scanning_continuity = scanning_continuity
+
+        # TODO: check how to initiate a cond mamba here
+        self.mixer = mixer_cls(dim)
+        self.norm = norm_cls(dim)
+
+        # w/o FFN
+        self.drop_path = DropPath(drp)
+
+def drop_path (x, drop_prob: float = 0.0, training: bool = False, scale_by_keep: bool = True):
+    """
+    Randomly kill all activations for some examples and scale up survivors to retain same expected value, so we dont have to upscale
+    during inference when dropout is disabled
+
+    Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)
+
+    This is the same as the DropConnect implementation for EfficientNet, however, the original name is misleading
+    as 'Drop Connect' is a different form of droupout in a separate paper.
+    See discussion: https://github.com/tensorflow/tpu/issues/494#issuecomment-532968956
+    This implementation opts to changing the layer and the argument names to 'drop path' and 'drop_prob' rather than
+    DropConnect and survival_rate respectively
+    """
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1) # (B, T, C) -> (B, 1, 1) so that works with diff dim tensors, not just 2D convnets
+    # new tensor same device and dtype as x
+    random_tensor = x.new_empty(shape).bernoulli_(keep_prob) # A tensor of shape (B, [1]*(x.ndim-1)) containing 0/1 with keep_prob; broad castable
+    
+    # if we dont scale_by_keep, during training mask * x scales output down by keep_prob on average
+    # to rectify we have to multiply by keep_prob during inference
+    # with scaling (inverted dropout) mask = mask / keep_prob, it automatically rectifies by scaling surviving units up by keep_prob
+    # so the expected value stays the same during train and test time
+    if keep_prob > 0.0 and scale_by_keep:
+        random_tensor.div_(keep_prob) 
+    return x * random_tensor
+
+
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample/ example level dropout (when applied in main path of residual blocks)
+    Kills all activations across all tokens/channels for some random examples in a batch
+    """
+
+    def __init__(self, drop_prob: float=0.0, scale_by_keep:bool=True):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+        self.scale_by_keep = scale_by_keep
+    
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
+    
+    def extra_repr(self):
+        return f"drop_prob={round(self.drop_prob,3):0.3f}"
