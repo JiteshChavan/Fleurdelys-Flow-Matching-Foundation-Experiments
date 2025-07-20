@@ -181,4 +181,45 @@ class TimestepEmbedder(nn.Module):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
+
+class LabelEmbedder(nn.Module):
+    """
+    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance
+    """
+
+    def __init__(self, num_classes, hidden_size, dropout_prob):
+        super().__init__()
+        use_cfg = dropout_prob > 0.0 # 1
+        self.in_channels = num_classes + 1 if use_cfg else num_classes # 1001 or 1000
+        self.embedding_table = nn.Embedding(self.in_channels, hidden_size)
+        self.num_classes = num_classes # 1000
+        self.dropout_prob = dropout_prob
+    
+    def token_drop(self, labels, force_drop_ids=None):
+        """
+        Drops labels to enable classifier-free guidance.
+        """
+
+        if force_drop_ids is None:
+            # drop labels where p < drop prob
+            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob # setup boolean tensor via elementwise comparison
+        else:
+            drop_ids = force_drop_ids == 1 # elementwise comparison with 1, drop labels where force_drop_ids is 1
+        
+        # for each index in labels, set labels to be num_classes where drop_ids is True
+        labels = torch.where(drop_ids, self.num_classes, labels) # 1000 or labels (1000 indexes into null label)
+
+        return labels
+    
+    def forward (self, labels, train, force_drop_ids=None):
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            labels = self.token_drop(labels, force_drop_ids)
+        embeddings = self.embedding_table(labels)
+        return embeddings
+    
+    def get_in_channels(self):
+        """Returns in_channels or number of classes in the embedding table matrix"""
+        return self.in_channels # 1001 if dropout_prob > 0.0 else 1000
+    
     
