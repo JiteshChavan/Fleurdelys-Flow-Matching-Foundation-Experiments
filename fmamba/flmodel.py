@@ -282,7 +282,122 @@ class FlBlock(nn.Module):
         self.norm = norm_cls(dim)
 
         # w/o FFN
-        self.drop_path = DropPath(drp)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        if self.fused_add_norm:
+            assert RMSNorm is not None, "RMSNorm import failed"
+            assert isinstance(
+                self.norm, (nn.LayerNorm, RMSNorm)
+            ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
+
+        self.norm_2 = norm_cls(dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True))
+        mlp_hidden_dim = int (dim * 4)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = GatedMLP(fan_in=dim, fan_h=mlp_hidden_dim, act_layer=approx_gelu, drop=0) # dim -> 4*dim -> dim
+    
+    def forward (
+            self,
+            hidden_states: Tensor,
+            residual: Optional[Tensor] = None,
+            y: Optional[Tensor] = None,
+            inference_params=None,
+    ):
+        r"""Pass the input signal through the encoder layer.
+        Args:
+            hidden_states: input signal (B,T,C), the sequence to the encoder layer (required)
+            residual: from previous block ? TODO: think, got it; hidden_states = Mixer(LN(residual))
+            we fuse add and norm before branching residual and mixer
+            y: label embedding (B, C)
+        """
+        if not self.fused_add_norm:
+            # manual addition then norm which then becomes new residual then mix it to get hidden states and forward to next block
+            if residual is None:
+                # block 0
+                residual = hidden_states
+            else:
+                # ADD
+                residual = residual + self.drop_path(hidden_states)
+            
+            # we have residual path for this block now compute the mixer branch
+            hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+        else:
+            fused_add_norm_fn = rms_norm_fn if isinstance(self.norm, RMSNorm) else layer_norm_fn
+            # case of block 0
+            if residual is None:
+                hidden_states, residual = fused_add_norm_fn(
+                    hidden_states,
+                    self.norm.weight,
+                    self.norm.bias,
+                    residual=residual,
+                    prenorm=True,
+                    residual_in_fp32=self.residual_in_fp32,
+                    eps=self.norm.eps,
+                )
+            else: 
+                # we do have a residual and hidden_state = mixer(LN(residual)) and we add and normalize them
+                hidden_states, residual= fused_add_norm_fn(
+                    self.drop_path(hidden_states),
+                    self.norm.weight,
+                    self.norm.bias,
+                    residual=residual,
+                    prenorm=True,
+                    residual_in_fp32=self.residual_in_fp32,
+                    eps=self.norm.eps,
+                )
+        
+        T = hidden_states.shape[1]
+        h = w = int(np.sqrt(T))
+
+        # Prepare the signal for computation
+        if self.transpose:
+            hidden_states = rearrange(hidden_states, "n (h w) c -> n (w h) c", h=h, w=w)
+        
+        # Reduce jumps in locality by scanning the image in zig-zag order
+        # left-right then right-left then left-right
+        if self.scanning_continuity:
+            # we have (B, T, C)
+            hidden_states = rearrange(hidden_states.clone(), "n (w h) c -> n c w h", h=h, w=w) # (B, c, w, h)
+            hidden_states[:, :, 1::2] = hidden_states[:, :, 1::2].flip(-1) # flip every alternate row so we index by zig zag scan
+            hidden_states = rearrange(hidden_states, "n c w h -> n (w h) c", h=h, w=w) # back to (B, T, C) from (B, C, W, H)
+        
+        # NOTE: Zigzag flip happens inside 2D space for maintaining spatial continuity; the final flip.(1) reverses the entire token sequence
+        # lets the model see the sequence in reverse order
+        # both the flips serve different goals
+        if self.reverse:
+            hidden_states = hidden_states.flip(1)
+        
+        scale_ssm, gate_ssm, shift_ssm, scale_mlp, gate_mlp, shift_mlp = self.adaLN_modulation(y).chunk(6, dim=-1) #(B, 6C)-> 6x(B, C)
+        hidden_states = hidden_states + gate_ssm.unsqueeze(1) * self.mixer(
+            modulate(hidden_states, shift_ssm, scale_ssm), y, inference_params=inference_params
+        )
+        
+        hidden_states = hidden_states + gate_mlp.unsqueeze(1) * self.mlp(modulate(hidden_states, shift_mlp, scale_mlp))
+
+        # transform the signal back
+        if self.reverse:
+            hidden_states = hidden_states.flip(1) # revert the flip across T
+        
+        if self.scanning_continuity:
+            # (B,T, C) -> (B, C, H, W)
+            hidden_states = rearrange(hidden_states.clone(), "n (w h) c -> n c w h", h=h, w=w) # (B, C, W, H)
+            hidden_states[:, :, 1::2] = hidden_states[:, :, 1::2].flip(-1) # revert flip every odd row
+            hidden_states = rearrange(hidden_states, "n c w h -> n (w h) c", h=h, w=w)
+        
+        if self.transpose:
+            hidden_states = rearrange(hidden_states, "n (w h) c -> n (h w) c", h=h, w=w)
+        
+        return hidden_states, residual
+    
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+    
+        
+
+        
 
 def drop_path (x, drop_prob: float = 0.0, training: bool = False, scale_by_keep: bool = True):
     """
