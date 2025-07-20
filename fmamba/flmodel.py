@@ -221,5 +221,19 @@ class LabelEmbedder(nn.Module):
     def get_in_channels(self):
         """Returns in_channels or number of classes in the embedding table matrix"""
         return self.in_channels # 1001 if dropout_prob > 0.0 else 1000
+
+class FinalLayer (nn.Module):
+    """
+    Final layer of the backbone
+    """
+    def __init__(self, hidden_size, patch_size, out_channels):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
     
-    
+    def forward(self, x, y):
+        scale, shift = self.adaLN_modulation(y).chunk(2, dim=-1) # 2x (B, C)
+        x = modulate(self.norm_final(x), shift, scale) # x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1) -> (B, T, C)
+        x = self.linear(x) # (B, T, C) - > (B, T, patch_size * patch_size * out_channels)
+        return x
