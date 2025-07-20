@@ -129,6 +129,56 @@ def interpolate_pos_embed(model, checkpoint_model):
             checkpoint_model["pos_embed"] = new_pos_embed
 
 
+# ----------------------------------------------------------------------------------------------
+# Embedding layers for Timesteps and Class Labels
+# ----------------------------------------------------------------------------------------------
 
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    """
 
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+    
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        Args:
+            t : Float, a 1-D tensor of B indices, one per batch element.
+            dim : the dimension of the output vector representation.
+            max_period: controls the minimum frequency of the embeddings.
+            retuns (B, dim=C) tensor representation corresponding to scalar timesteps t (B,) 
+        """
 
+        half = dim // 2
+        # interpolate linearly between 0 and -log(max_period) [0, log(f_min)] then exponentiate (decay 1 -> f_min)
+        # gives us linearly spaced frequencies in logspace
+        # exponentiation results in exponential decay between [1, 1/max_period] i.e [1, f_min]
+        # (C/2)
+        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(device=t.device)
+        # t (B,)
+        # outer product to get (B, C/2)
+        # three ways
+        #args = torch.einsum("B,C->BC", t, freqs) # outer product < (B), (C/2)> -> (B, C/2)
+        #args = t.unsqueeze(1) * freqs #(B, 1) * (C/2) -> (B, C/2)
+        args = t[:, None].float() * freqs # (B, 1) * (C/2)
+        
+        embedding = torch.cat((torch.sin(args), torch.cos(args)), dim=-1)
+
+        if dim % 2 != 0:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+    
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+    
