@@ -27,6 +27,7 @@ from CrossAttentionFusion import CrossAttentionFusion
 from dct_layer import init_dct_kernel, init_idct_kernel
 from einops import rearrange
 from mlp import GatedMLP
+from scanning_orders import SCAN_ZOO, local_reverse, local_scan, reverse_permut_np
 from switch_mlp import SwitchMLP
 from wavelet_layer import DWT_2D, IDWT_2D
 
@@ -321,7 +322,7 @@ class FlBlock(nn.Module):
                 residual = residual + self.drop_path(hidden_states)
             
             # we have residual path for this block now compute the mixer branch
-            hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
+            hidden_states = self.norm(residual) if isinstance(self.norm, nn.Identity) else self.norm(residual.to(dtype=self.norm.weight.dtype))
             if self.residual_in_fp32:
                 residual = residual.to(torch.float32)
         else:
@@ -400,7 +401,156 @@ class FlBlock(nn.Module):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
     
+class DiMBlockWindow(nn.Module):
+    def __init__(
+            self,
+            dim,
+            mixer_cls,
+            norm_cls=nn.LayerNorm,
+            fused_add_norm=False,
+            residual_in_fp32=False,
+            drop_path=0.0,
+            reverse=False,
+            transpose=False,
+            scanning_continuity=False,
+            skip=False,
+            shift_window=False,
+    ):
+        """
+        Simple block around a mixer class with LayerNorm/RMSNorm and residual connection.
+
+        Just like before, its still pre norm residual block with slightly different structure that allows
+        to fuse addition back into residual pathway and then normalization.
+        Purely for performance reasons, as we can fuse addition into residual path and LayerNorm.
+        Residual needs to be provided except for the first block
+        """
+        super().__init__()
+        self.residual_in_fp32 = residual_in_fp32
+        self.fused_add_norm = fused_add_norm
+        self.reverse = reverse
+        self.transpose = transpose
+        self.scanning_continuity = scanning_continuity
+        self.shift_window = shift_window
+
+        self.mixer = mixer_cls(dim)
+        self.norm = norm_cls(dim)
         
+        #w/o FFN
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        if self.fused_add_norm:
+            assert RMSNorm is not None, f"RMSNorm import failed"
+            assert isinstance(self.norm, (nn.LayerNorm, RMSNorm)), f"Only LayerNorm and RMSNorm are supported for fused_add_norm"
+        
+        self.norm_2 = norm_cls(dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True))
+        mlp_hidden_dim = int (4 * dim)
+        approx_gelu = lambda:nn.GELU(approximate="tanh")
+        self.mlp = GatedMLP(fan_in=dim, fan_h=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+    
+    def forward(
+            self,
+            hidden_states: Tensor,
+            residual: Optional[Tensor] = None,
+            y: Optional[Tensor] = None,
+            inference_params=None,
+    ):
+        r"""Pass the input signal through the encoder layer.
+        
+        Args:
+            hidden_states: input signal (B, T, C) to the encoder layer (required)
+            residual:  from previous block hidden_states = Mixer (LN(residual)) if residual is not None
+            First we fuse add and norm before branching residual and hidden_states
+            y: label embeddings (B, C)
+        """
+        if not self.fused_add_norm:
+            if residual is None:
+                residual = hidden_states
+            else:
+                residual = residual + self.drop_path(hidden_states)
+            
+            hidden_states = self.norm(residual) if isinstance (self.norm, nn.Identity) else self.norm(residual.to(dtype=self.norm.weight.dtype))
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+        else:
+            fused_add_norm_fn = rms_norm_fn if isinstance(self.norm, RMSNorm) else layer_norm_fn
+            if residual is None:
+                hidden_states, residual = fused_add_norm_fn(
+                    hidden_states,
+                    self.norm.weight,
+                    self.norm.bias,
+                    residual=residual, # None
+                    prenorm=True,
+                    residual_in_fp32=self.residual_in_fp32,
+                    eps=self.norm.eps,
+                )
+            else:
+                hidden_states, residual = fused_add_norm_fn(
+                    self.drop_path(hidden_states),
+                    self.norm.weight,
+                    self.norm.bias,
+                    residual=residual,
+                    prenorm=True,
+                    residual_in_fp32=self.residual_in_fp32,
+                    eps=self.norm.eps,
+                )
+        # I have residual <- supposed to be returned and hidden_state = norm(residual) <- this is supposed to go into mixer
+        # shape (B, T, C)
+        # transpose, scanning continuity, token reversal (for bidrectional bias)
+        
+        T = hidden_states.shape[1]
+        w = h = int (np.sqrt(T))
+
+        # unrelated but Usually raster store is B, C, H, W -> transpose B, C, W, H zigzag along dim=-1 gives vertical zig zag scan
+        # intenally reconstructs B, C, H, W, orders in column major or row major scan in non overlapping windows of specified size
+        column_first = True if self.transpose else False
+        hidden_states = local_scan (hidden_states, w=4, H=h, W=w, column_first=column_first).contiguous() #(B, T, C) make sure to have contiguous layout so its safer to view/reshape without losing order
+
+        if self.shift_window:
+            # move content up-left, to break alignment patterns and break positional aliasing
+            # (B, T, C)-> (B, H, W, C)
+            hidden_states = rearrange(hidden_states, "b (h w) c -> b h w c", h=h)
+            hidden_states = torch.roll(hidden_states, shifts=(-1, -1), dims=(1, 2)).reshape(-1, h * w, hidden_states.size(-1))
+        
+        if self.reverse:
+            hidden_states = hidden_states.flip(1) # (B, T, C)
+        
+        # now we have hidden states in desired scan orders
+        scale_ssm, gate_ssm, shift_ssm, scale_mlp, gate_mlp, shift_mlp = self.adaLN_modulation(y).chunk(6, dim=-1) # (B, 6C) -> 6(B, C)
+
+        hidden_states = hidden_states + gate_ssm.unsqueeze(1) * self.mixer(
+            modulate(hidden_states, shift_ssm, scale_ssm), y, inference_params=inference_params
+        )
+
+        hidden_states = hidden_states + gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm_2(hidden_states), shift_mlp, scale_mlp)
+        )
+
+        # transform back
+        if self.reverse:
+            hidden_states = hidden_states.flip(1) # (B, T, C)
+        
+        if self.shift_window:
+            # convert to (B, H, W, C) undo the shift (induced to break positional aliasing and alignment patterns)
+            hidden_states = rearrange(hidden_states, "b (h w) c -> b h w c", h=h) # (B, H, W, C)
+            hidden_states = torch.roll (hidden_states, shifts=(1, 1), dims=(1, 2)).reshape(-1, h * w, hidden_states.size(-1))
+        
+        hidden_states = local_reverse(hidden_states, w=4, H=h, W=w, column_first=column_first)
+
+        return hidden_states, residual
+
+
+            
+
+
+
+
+
+
+        
+
+
 
         
 
@@ -449,3 +599,4 @@ class DropPath(nn.Module):
     
     def extra_repr(self):
         return f"drop_prob={round(self.drop_prob,3):0.3f}"
+

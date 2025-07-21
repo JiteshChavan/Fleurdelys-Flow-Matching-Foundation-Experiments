@@ -49,7 +49,7 @@ class GatedMLP(nn.Module):
             fan_in: int,
             fan_h: int = None,
             fan_out: int = None,
-            act_layer = nn.GELU,
+            act_layer = lambda:nn.GELU(approximate="tanh"),
             drop: float = 0.0,
             bias: bool = True,
     )-> None:
