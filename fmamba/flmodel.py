@@ -207,7 +207,7 @@ class LabelEmbedder(nn.Module):
             drop_ids = force_drop_ids == 1 # elementwise comparison with 1, drop labels where force_drop_ids is 1
         
         # for each index in labels, set labels to be num_classes where drop_ids is True
-        labels = torch.where(drop_ids, self.num_classes, labels) # 1000 or labels (1000 indexes into null label)
+        labels = torch.where(drop_ids, self.num_classes, labels) # 1000 or labels (table[1000] = null label)
 
         return labels
     
@@ -287,7 +287,7 @@ class FlBlock(nn.Module):
             assert RMSNorm is not None, "RMSNorm import failed"
             assert isinstance(
                 self.norm, (nn.LayerNorm, RMSNorm)
-            ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
+            ), f"Only LayerNorm and RMSNorm are supported for fused_add_norm"
 
         self.norm_2 = norm_cls(dim)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -332,7 +332,7 @@ class FlBlock(nn.Module):
                     hidden_states,
                     self.norm.weight,
                     self.norm.bias,
-                    residual=residual,
+                    residual=residual, # None
                     prenorm=True,
                     residual_in_fp32=self.residual_in_fp32,
                     eps=self.norm.eps,
@@ -349,7 +349,7 @@ class FlBlock(nn.Module):
                     eps=self.norm.eps,
                 )
         
-        T = hidden_states.shape[1]
+        T = hidden_states.shape[1] # (B, T, C)
         h = w = int(np.sqrt(T))
 
         # Prepare the signal for computation
@@ -358,10 +358,14 @@ class FlBlock(nn.Module):
         
         # Reduce jumps in locality by scanning the image in zig-zag order
         # left-right then right-left then left-right
+        # seems like top to bottom then bottom-top then top-bottom so on
+        # note that zig zag order depends on how the image is stored in B, T, C and w,h are just semantic and thusly interchangeable labels
+        # id assume its a raster scan storage, so B, C, H, W if transpose true it becomes B, C, W, H which implies flipping along H
+        # hence vertical zig zag
         if self.scanning_continuity:
             # we have (B, T, C)
             hidden_states = rearrange(hidden_states.clone(), "n (w h) c -> n c w h", h=h, w=w) # (B, c, w, h)
-            hidden_states[:, :, 1::2] = hidden_states[:, :, 1::2].flip(-1) # flip every alternate row so we index by zig zag scan
+            hidden_states[:, :, 1::2] = hidden_states[:, :, 1::2].flip(-1) # flip every alternate column along height axis so we index by zig zag scan (vertical zig zag in this case)
             hidden_states = rearrange(hidden_states, "n c w h -> n (w h) c", h=h, w=w) # back to (B, T, C) from (B, C, W, H)
         
         # NOTE: Zigzag flip happens inside 2D space for maintaining spatial continuity; the final flip.(1) reverses the entire token sequence
@@ -375,7 +379,8 @@ class FlBlock(nn.Module):
             modulate(hidden_states, shift_ssm, scale_ssm), y, inference_params=inference_params
         )
         
-        hidden_states = hidden_states + gate_mlp.unsqueeze(1) * self.mlp(modulate(hidden_states, shift_mlp, scale_mlp))
+        # forgot to pre normalize before mlp branch :P
+        hidden_states = hidden_states + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm_2(hidden_states), shift_mlp, scale_mlp))
 
         # transform the signal back
         if self.reverse:
