@@ -401,7 +401,7 @@ class FlBlock(nn.Module):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
     
-class DiMBlockWindow(nn.Module):
+class FlBlockWindow(nn.Module):
     def __init__(
             self,
             dim,
@@ -545,7 +545,7 @@ class DiMBlockWindow(nn.Module):
         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
 
-class WaveDimBlock(nn.Module):
+class WaveFlBlock(nn.Module):
     def __init__(
             self,
             dim,
@@ -751,15 +751,15 @@ class WaveDimBlock(nn.Module):
             hidden_states = hidden_states.flip(1)
         
         if self.scanning_continuity:
-            hidden_states = rearrange(hidden_states.clone(), "b (h w) c -> b c h w", h=h, w=w)
+            hidden_states = rearrange(hidden_states.clone(), "b (w h) c -> b c w h", h=h, w=w)
             hidden_states[:, :, 1::2] = hidden_states[:, :, 1::2].flip(-1)
-            hidden_states = rearrange(hidden_states, "b c h w -> b (h w) c", h=h, w=w)
+            hidden_states = rearrange(hidden_states, "b c w h -> b (w h) c", h=h, w=w)
         
         if self.window_scan:
             hidden_states = local_reverse(hidden_states, w=w // patch_size, H=h, W=w, column_first=column_first)
         else:
             if self.transpose:
-                hidden_states = rearrange (hidden_states, "b (h w) c -> b (w h) c", h=h, w=w)
+                hidden_states = rearrange (hidden_states, "b (w h) c -> b (h w) c", h=h, w=w)
         
         # TODO: we refrain from IDWT for reasons explained in the paper
         return hidden_states, residual
@@ -804,13 +804,314 @@ class MoEBlock(nn.Module):
         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=None, **kwargs)
 
 
+class FlBlockCombined(nn.Module):
+    def __init__(
+            self,
+            dim,
+            mixer_cls,
+            norm_cls=nn.LayerNorm,
+            fused_add_norm=False,
+            residual_in_fp32=False,
+            drop_path=0.0,
+            reverse=False,
+            transpose=False,
+            scanning_continuity=False,
+            use_gated_mlp=True,
+    ):
+        """
+        Block wrapping a parallel spatial and frequency ssm blocks with residual and hidden states from previous block.
+        Still the standard prenorm block, just slightly different structure so we can fuse addition, back into residual pathway,
+        and then normalization to branch towards the mixer.
+        Purely for performance reasons as we can fuse add->norm
+        Residual has to be specified unless its the very first block.
+        """
+        super().__init__()
+        self.residual_in_fp32 = residual_in_fp32
+        self.fused_add_norm = fused_add_norm
+        self.reverse = reverse
+        self.transpose = transpose
+        self.scanning_continuity = scanning_continuity
 
+        self.norm = norm_cls(dim)
 
+        # TODO: Ablate here, each branch having access to only half the channels and then concatenation
+        self.spatial_mamba = FlBlockRaw(
+            dim // 2,
+            mixer_cls,
+            norm_cls=nn.Identity,
+            drop_path=0.0,
+            fused_add_norm=False,
+            residual_in_fp32=residual_in_fp32,
+            reverse=reverse,
+            transpose=transpose,
+            scanning_continuity=scanning_continuity,
+            y_dim=dim,
+        )
     
+        # TODo: Ablate they dont setup an MLP in freq mamba block maybe because relying on IDWT
+        self.freq_mamba = WaveFlBlock(
+            dim // 2,
+            mixer_cls,
+            norm_cls=nn.Identity,
+            drop_path=0.0,
+            fused_add_norm=False,
+            residual_in_fp32=residual_in_fp32,
+            reverse=False,
+            transpose=reverse, # tranpose, # disable if only left to right scanning is used
+            scanning_continuity=scanning_continuity,
+            no_ffn=True,
+            y_dim=dim,
+            num_wavelet_lv=2,
+        )
 
+        # TODO: Ablate
+        self.proj = CrossAttentionFusion(dim, num_heads=8, qkv_bias=True, swap_k=False)
 
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
+        if self.fused_add_norm:
+            assert RMSNorm is not None, f"RMSNorm import failed"
+            assert isinstance(self.norm, (nn.LayerNorm, RMSNorm)), f"fused_add_norm is only supported for layer norm and rms norm"
         
+        self.norm_2 = norm_cls(dim)
+
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 3*dim, bias=True))
+        mlp_hidden_dim = int(dim * 4)
+        approx_gelu = lambda:nn.GELU(approximate="tanh")
+        if use_gated_mlp:
+            self.mlp = GatedMLP (fan_in=dim, mlp_hidden_dim=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        else:
+            self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+    
+    def forward(
+            self,
+            hidden_states: Tensor,
+            residual: Optional[Tensor],
+            y: Optional[Tensor],
+            inference_params=None,
+    ):
+        """
+            Pass the input signal (B, T, C) through the FlBlock (spatial, freq ssm, ssm fusion)
+            
+            Args:
+                hidden_states: input sequence to the FlBlock (required)
+                residual: residual from previous block. hidden_states = Mixer(LN(residual))
+                
+            We fuse add (residual + hidden_states) then norm, before branching residual mixer
+        """
+
+        if not self.fused_add_norm:
+            if residual is None:
+                residual = hidden_states
+            else:
+                residual = residual + self.drop_path(hidden_states)
+            
+            hidden_states = self.norm(residual) if isinstance(self.norm, nn.Identity) else self.norm(residual.to(dtype=self.norm.weight.dtype))
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+        else:
+            fused_add_norm_fn = rms_norm_fn if isinstance(self.norm, RMSNorm) else layer_norm_fn
+            if residual is None:
+                hidden_states, residual = fused_add_norm_fn(
+                    hidden_states, # no drop path since residual is None (very first block)
+                    self.norm.weight,
+                    self.norm.bias,
+                    residual=residual, # None
+                    prenorm=True,
+                    residual_in_fp32=self.residual_in_fp32,
+                    eps=self.norm.eps,
+                )
+            else:
+                hidden_states, residual = fused_add_norm_fn(
+                    self.drop_path(hidden_states), # drop path since residual is present
+                    self.norm.weight,
+                    self.norm.bias,
+                    residual=residual, # Not None
+                    prenorm=True,
+                    residual_in_fp32=self.residual_in_fp32,
+                    eps=self.norm.eps,
+                )
+        # Now we have hidden_states (B, T, C) = LN(residual) and residual
+        
+        x1, x2 = hidden_states.chunk(2, dim=-1) #2x(B, T, C/2)
+        # TODO: Ablation, use the residual instead of discarding it
+        x1, _ = self.spatial_mamba(x1, None, y, inference_params) # 2x(B, T, C/2)
+        x2, _ = self.freq_mamba(x2, None, y, inference_params) # 2x(B, T, C/2)
+        
+        # TODO: Ablation, residual connection over fusion layer
+        # TODO: Ablation, give options for fusion layer
+        if isinstance(self.proj, CrossAttentionFusion):
+            x = self.proj(x1, x2) # (B, T, C)
+        else:
+            x = torch.cat((x1, x2), dim=-1)
+            x = self.proj(x) # (B, T, C/2)
+        
+        hidden_states = hidden_states + x
+        # FFN
+        scale_mp, gate_mlp, shift_mlp = self.adaLN_modulation(y).chunk(3, dim=-1) #3x(B, C)
+
+        hidden_states = hidden_states + gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm_2(hidden_states), shift_mlp, scale_mp)
+        )
+
+        return hidden_states, residual
+
+class FlBlockRaw(nn.Module):
+    def __init__(
+            self,
+            dim,
+            mixer_cls,
+            norm_cls=nn.LayerNorm,
+            fused_add_norm=False,
+            residual_in_fp32=False,
+            drop_path=0.0,
+            reverse=False,
+            transpose=False,
+            scanning_continuity=False,
+            y_dim=None,
+            no_ffn=False,
+    ):
+        """
+        
+        A block around SSM mixer block with residual and LayerNorm/RMSNorm.
+        Takes two inputs hidden_states and residua. Residual being from the preivous block.
+
+        Still the standard prenorm block with slightly different structure, solely for performance reasons
+        as we can fuse addition, back into residual path, and norm.
+
+        Residual has to be specified except for very first block.
+
+        We add hidden_states from mixer of previous block, into residual pathway and then normalize to branch residual and mixer.
+        """
+
+        super().__init__()
+        self.residual_in_fp32 = residual_in_fp32
+        self.fused_add_norm = fused_add_norm
+        self.reverse = reverse
+        self.transpose = transpose
+        self.scanning_continuity = scanning_continuity
+        y_dim = dim if y_dim is None else y_dim
+        
+        self.no_ffn = no_ffn
+
+        self.mixer = mixer_cls(dim)
+        self.norm = norm_cls(dim)
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        if self.fused_add_norm:
+            assert RMSNorm is not None, f"RMSNorm import failed"
+            assert isinstance(self.norm, (nn.LayerNorm, RMSNorm)), f"fused_add_norm only supported for RMSNorm or LayerNorm"
+        
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 3 * dim if self.no_ffn else 6 * dim, bias=True))
+
+        if not self.no_ffn:
+            self.norm_2 = norm_cls(dim)
+
+            mlp_hidden_dim = int (4 * dim)
+            approx_gelu = lambda:nn.GELU(approximate="tanh")
+            self.mlp = GatedMLP(fan_in=dim, fan_h=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+    
+    def forward(
+            self,
+            hidden_states: Tensor,
+            residual: Optional[Tensor] = None,
+            y: Optional[Tensor] = None,
+            inference_params=None,
+    ):
+        """
+        Pass the input signal (B, T, C) through the spatial SSM block.
+
+        Args:
+            hidden_states: input signal (B, T, C) to the block
+            residual: residual from the previous block. hidden_states = Mixer(Norm(residual))
+            We fuse add (residual, hidden_states) and then norm before branching residual and mixer
+
+            y: class label embedding, guidance embedding
+        """
+        if not self.fused_add_norm:
+            if residual is None:
+                residual = hidden_states
+            else:
+                residual = residual + self.drop_path(hidden_states)
+            
+            hidden_states = self.norm(residual) if isinstance(self.norm, nn.Identity) else self.norm(residual.to(dtype=self.norm.weight.dtype))
+
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+        else:
+            fused_add_norm_fn = rms_norm_fn if isinstance(self.norm, RMSNorm) else layer_norm_fn
+            if residual is None:
+                hidden_states, residual = fused_add_norm_fn(
+                    hidden_states,
+                    self.norm.weight,
+                    self.norm.bias,
+                    residual=residual, # None
+                    prenorm=True,
+                    residual_in_fp32=self.residual_in_fp32,
+                    eps=self.norm.eps,
+                )
+            else:
+                hidden_states, residual = fused_add_norm_fn(
+                    self.drop_path(hidden_states),
+                    self.norm.weight,
+                    self.norm.bias,
+                    residual=residual,
+                    prenorm=True,
+                    residual_in_fp32=self.residual_in_fp32,
+                    eps=self.norm.eps,
+                )
+        # Now I have residual (<- To be returned (B, T, C)) and hidden_states after norm, to be processed by mixer
+        
+        T = hidden_states.shape[1]
+        h = w = int (np.sqrt(T))
+        if self.transpose:
+            hidden_states = rearrange(hidden_states, "b (h w) c -> b (w h) c", h=h, w=w)
+        
+        if self.scanning_continuity:
+            hidden_states = rearrange(hidden_states.clone(), "b (w h) c -> b c w h", h=h, w=w)
+            hidden_states[:, :, 1::2] = hidden_states[:, :, 1::2].flip(-1)
+            hidden_states = rearrange(hidden_states, "b c w h -> b (w h) c", h=h, w=w) # (B, T, C)
+        
+        if self.reverse:
+            hidden_states = hidden_states.flip(1) # flip along tokens
+
+        if not self.no_ffn:
+            scale_ssm, gate_ssm, shift_ssm, scale_mlp, gate_mlp, shift_mlp = self.adaLN_modulation(y).chunk(6, dim=-1) #(B, 6C) -> 6x(B,C)
+
+            hidden_states = hidden_states + gate_ssm.unsqueeze(1) * self.mixer (
+                modulate(hidden_states, shift_ssm, scale_ssm), y, inference_params=inference_params
+            )
+            hidden_states = hidden_states + gate_mlp.unsqueeze(1) * self.mlp(
+                modulate(self.norm_2(hidden_states), shift_mlp, scale_mlp)
+            )
+        else:
+            scale_ssm, gate_ssm, shift_ssm = self.adaLN_modulation(y).chunk(3, dim=-1) #(B, 3C) -> 3x(B, C)
+
+            hidden_states = hidden_states + gate_ssm.unsqueeze(1) * self.mixer(
+                modulate(hidden_states, shift_ssm, scale_ssm), y, inference_params=inference_params
+            )
+        
+        # transform back
+        if self.reverse:
+            hidden_states = hidden_states.flip(1)
+        
+        if self.scanning_continuity:
+            hidden_states = rearrange(hidden_states.clone(), "b (w h) c -> b c w h", h=h, w=w)
+            hidden_states[:, :, 1::2] = hidden_states[:, :, 1::2].flip(-1)
+            hidden_states = rearrange(hidden_states, "b c w h -> b (w h) c", h=h, w=w)
+        
+        if self.transpose:
+            hidden_states = rearrange (hidden_states, "b (w h) c -> b (h w) c", h=h, w=w)
+        
+
+        return hidden_states, residual
+    
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+
+
+
+
 
 
 
